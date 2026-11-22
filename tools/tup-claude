@@ -36,6 +36,9 @@ add   "$CWD"                       # the project working tree (rw)
 add   "$CLAUDE_CFG"                # claude config / auth / transcripts (rw)
 [ -n "${GROVY_STATE_DIR:-}" ] && add "$GROVY_STATE_DIR"   # grovy unix socket + settings (rw)
 addro "$(dirname "$REAL_CLAUDE")"  # the claude binary's directory
+case "$REAL_CLAUDE" in             # the whole claude data dir (…/share/claude), if that's the layout
+  */share/claude/*) addro "${REAL_CLAUDE%%/share/claude/*}/share/claude" ;;
+esac
 addro "$HOME/.local/bin"           # the claude symlink, if present
 oldifs=$IFS; IFS=:                 # grovy python libs for the hooks (PYTHONPATH)
 for d in ${PYTHONPATH:-}; do addro "$d"; done

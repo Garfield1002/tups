@@ -13,3 +13,6 @@ opt-level = "z"
 lto = true
 strip = true
 panic = "abort"
+
+[dependencies]
+libc = "0.2.191"

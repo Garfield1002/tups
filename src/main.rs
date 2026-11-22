@@ -163,16 +163,34 @@ fn bwrap_args(root: &Path, project: &str, net: Net, chdir: &str) -> Vec<OsString
     a
 }
 
+/// Opt-in hardening (`--harden`). Scoped to the two bwrap flags that are correct
+/// regardless of uid mapping or cgroup delegation:
+///   --cap-drop ALL : the sandboxed process keeps no capabilities, so even a namespace
+///                    escape lands with an empty capability set (big deal when, as in some
+///                    deployments, the container is root-mapped).
+///   --new-session  : setsid, so the sandbox can't TIOCSTI-inject into the parent terminal.
+/// (Non-root uid, seccomp, and cgroup mem/pids limits are the next increment — they need
+/// in-container build+test in the target's uid/systemd setup; see DESIGN.md.)
+fn harden_args(harden: bool) -> Vec<OsString> {
+    if harden {
+        vec!["--cap-drop".into(), "ALL".into(), "--new-session".into()]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Assemble the full command: pasta(outer) + bwrap(inner) for Net::Pasta, else bwrap.
 fn assemble(
     root: &Path,
     project: &str,
     net: Net,
     chdir: &str,
+    harden: bool,
     extra_bwrap: Vec<OsString>,
     inner: Vec<OsString>,
 ) -> Command {
     let mut bw = bwrap_args(root, project, net, chdir);
+    bw.extend(harden_args(harden));
     bw.extend(extra_bwrap);
     bw.push("--".into());
     bw.extend(inner);
@@ -196,30 +214,29 @@ fn assemble(
     }
 }
 
-/// Pull an optional `--net <mode>` out of the argument list.
-fn parse_net(args: &[String]) -> (Net, Vec<String>) {
-    let mut net = Net::Pasta;
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--net" {
-            let v = args.get(i + 1).map(String::as_str);
-            net = match v {
-                Some("pasta") => Net::Pasta,
-                Some("host") => Net::Host,
-                Some("none") => Net::None,
-                other => {
-                    eprintln!("tup: unknown --net '{}'", other.unwrap_or(""));
-                    exit(2);
-                }
-            };
-            i += 2;
-        } else {
-            out.push(args[i].clone());
-            i += 1;
+fn net_from_str(v: Option<&str>) -> Net {
+    match v {
+        Some("pasta") => Net::Pasta,
+        Some("host") => Net::Host,
+        Some("none") => Net::None,
+        other => {
+            eprintln!("tup: unknown --net '{}'", other.unwrap_or(""));
+            exit(2);
         }
     }
-    (net, out)
+}
+
+/// Persist/read a project's net mode, so `tup move` restores it instead of silently
+/// resetting to the pasta default (which would hand a `--net none` session open egress).
+fn write_net(project: &str, net: Net) {
+    let _ = fs::write(project_dir(project).join("net"), net.label());
+}
+
+fn read_net_label(project: &str) -> String {
+    fs::read_to_string(project_dir(project).join("net"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|_| "pasta".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -235,22 +252,19 @@ fn cmd_run(args: &[String]) {
     // Parse options: --net, --bind (rw), --ro-bind, --chdir, then the positional project.
     let mut net = Net::Pasta;
     let mut chdir: Option<String> = None;
+    let mut harden = false;
     let mut extra: Vec<OsString> = Vec::new();
     let mut project: Option<String> = None;
     let mut i = 0;
     while i < opts.len() {
         match opts[i].as_str() {
             "--net" => {
-                net = match opts.get(i + 1).map(String::as_str) {
-                    Some("pasta") => Net::Pasta,
-                    Some("host") => Net::Host,
-                    Some("none") => Net::None,
-                    other => {
-                        eprintln!("tup: unknown --net '{}'", other.unwrap_or(""));
-                        exit(2);
-                    }
-                };
+                net = net_from_str(opts.get(i + 1).map(String::as_str));
                 i += 2;
+            }
+            "--harden" => {
+                harden = true;
+                i += 1;
             }
             "--bind" | "--ro-bind" => {
                 let flag = if opts[i] == "--bind" { "--bind" } else { "--ro-bind" };
@@ -285,7 +299,7 @@ fn cmd_run(args: &[String]) {
     let project = match project {
         Some(p) => p,
         None => {
-            eprintln!("usage: tup run [--net M] [--bind P] [--ro-bind P] [--chdir P] <project> [-- <cmd>]");
+            eprintln!("usage: tup run [--net M] [--harden] [--bind P] [--ro-bind P] [--chdir P] <project> [-- <cmd>]");
             exit(2);
         }
     };
@@ -298,8 +312,12 @@ fn cmd_run(args: &[String]) {
     let chdir = chdir.unwrap_or_else(|| "/work".to_string());
     let inner: Vec<OsString> = cmd.iter().map(OsString::from).collect();
 
-    eprintln!("[tup] run project={project} net={} chdir={chdir}", net.label());
-    let mut c = assemble(&root, &project, net, &chdir, extra, inner);
+    eprintln!(
+        "[tup] run project={project} net={} chdir={chdir}{}",
+        net.label(),
+        if harden { " [hardened]" } else { "" }
+    );
+    let mut c = assemble(&root, &project, net, &chdir, harden, extra, inner);
     match c.status() {
         Ok(status) => exit(status.code().unwrap_or(1)),
         Err(e) => {
@@ -377,13 +395,33 @@ fn poll_init_pid(project: &str, tries: u32) -> Option<i32> {
 }
 
 fn cmd_up(args: &[String]) {
-    let (net, rest) = parse_net(args);
+    let mut net = Net::Pasta;
+    let mut harden = false;
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--net" => {
+                net = net_from_str(args.get(i + 1).map(String::as_str));
+                i += 2;
+            }
+            "--harden" => {
+                harden = true;
+                i += 1;
+            }
+            _ => {
+                rest.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
     if rest.is_empty() {
-        eprintln!("usage: tup up [--net pasta|host|none] <project>");
+        eprintln!("usage: tup up [--net pasta|host|none] [--harden] <project>");
         exit(2);
     }
     let project = &rest[0];
     let root = ensure_project_root(project);
+    write_net(project, net); // so `tup move` restores this net mode, not the pasta default
     let exe = env::current_exe().unwrap_or_else(|e| {
         eprintln!("tup: cannot find own path: {e}");
         exit(1);
@@ -402,9 +440,13 @@ fn cmd_up(args: &[String]) {
         .map(OsString::from)
         .collect();
 
-    let mut c = assemble(&root, project, net, "/work", extra, inner);
+    let mut c = assemble(&root, project, net, "/work", harden, extra, inner);
     install_forwarders();
-    eprintln!("[tup] up project={project} net={} (PID-1 supervisor)", net.label());
+    eprintln!(
+        "[tup] up project={project} net={} (PID-1 supervisor){}",
+        net.label(),
+        if harden { " [hardened]" } else { "" }
+    );
     let mut child = match c.spawn() {
         Ok(ch) => ch,
         Err(e) => {
@@ -413,9 +455,27 @@ fn cmd_up(args: &[String]) {
         }
     };
     CHILD_PID.store(child.id() as i32, Ordering::SeqCst);
-    match poll_init_pid(project, 100) {
-        Some(p) => INIT_PID.store(p, Ordering::SeqCst),
-        None => eprintln!("[tup] warning: could not locate init pid; shutdown may be abrupt"),
+    // Locate the sandbox PID 1 so terminating signals reach it directly (clean quiesce).
+    // Don't give up after one short poll: if the container is slow to start, keep retrying
+    // in the background, otherwise INIT_PID stays -1 and Ctrl-C would hit the monitor and
+    // trigger the die-with-parent SIGKILL cascade — skipping quiesce for the session's life.
+    if let Some(p) = poll_init_pid(project, 100) {
+        INIT_PID.store(p, Ordering::SeqCst);
+    } else {
+        let proj = project.to_string();
+        std::thread::spawn(move || {
+            for _ in 0..600 {
+                if INIT_PID.load(Ordering::SeqCst) > 0 {
+                    return;
+                }
+                if let Some(p) = find_init_pid(&proj) {
+                    INIT_PID.store(p, Ordering::SeqCst);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        eprintln!("[tup] init pid not found yet; retrying in background for clean shutdown");
     }
     let status = child.wait().unwrap_or_else(|e| {
         eprintln!("tup: wait failed: {e}");
@@ -824,50 +884,89 @@ fn local_move(project: &str, newproj: &str) {
         eprintln!("tup: invalid target project '{newproj}'");
         exit(2);
     }
-    let src_root = project_dir(project).join("root");
+    if newproj == project {
+        eprintln!("tup: source and destination are the same project");
+        exit(2);
+    }
+    // Never rsync --delete over a LIVE destination — that would wipe its working tree out
+    // from under a running agent and bring up a second supervisor on the same root.
+    if find_init_pid(newproj).is_some() {
+        eprintln!("tup: destination '{newproj}' is running — stop it first");
+        exit(1);
+    }
+    let src_dir = project_dir(project);
     let dst_dir = project_dir(newproj);
     let dst_root = dst_dir.join("root");
     let _ = fs::create_dir_all(&dst_root);
 
-    let s = format!("{}/", src_root.display());
+    let s = format!("{}/", src_dir.join("root").display());
     let d = format!("{}/", dst_root.display());
     run_rsync(&["-a", "--delete", &s, &d]);
 
-    let src_svc = project_dir(project).join("services");
+    let src_svc = src_dir.join("services");
     if src_svc.exists() {
-        let _ = fs::copy(&src_svc, dst_dir.join("services"));
+        if let Err(e) = fs::copy(&src_svc, dst_dir.join("services")) {
+            eprintln!("tup: failed to copy services manifest: {e}");
+            exit(1); // don't start the target with an empty service set and report success
+        }
     }
-    eprintln!("[tup] shipped root: {project} -> {newproj}");
+    let net = read_net_label(project);
+    let _ = fs::copy(src_dir.join("net"), dst_dir.join("net"));
+    eprintln!("[tup] shipped root: {project} -> {newproj} (net={net})");
 
-    // Bring the project up on the "target" (same host, new root) and confirm it resumed.
+    // Bring the project up on the "target" with the SAME net mode, and confirm it resumed.
     let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("tup"));
     let log = dst_dir.join("up.log");
-    spawn_detached(&exe, &["up".to_string(), newproj.to_string()], &log);
+    spawn_detached(
+        &exe,
+        &["up".to_string(), "--net".to_string(), net, newproj.to_string()],
+        &log,
+    );
     match poll_init_pid(newproj, 150) {
         Some(p) => eprintln!("[tup] resumed as '{newproj}' (init pid {p}); log {}", log.display()),
         None => eprintln!("[tup] warning: '{newproj}' did not come up; see {}", log.display()),
     }
 }
 
+fn remote_running(dest: &str, project: &str) -> bool {
+    Command::new("ssh")
+        .arg(dest)
+        .arg(format!("pgrep -f '/run/tup init {project}' >/dev/null 2>&1"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 fn remote_move(project: &str, dest: &str) {
     // Ship to ~/.tup/<project> on the remote (rsync remote paths are relative to $HOME),
     // then start it there detached. Assumes `tup` is on PATH on the remote.
-    let src_root = project_dir(project).join("root");
-    let s = format!("{}/", src_root.display());
+    if remote_running(dest, project) {
+        eprintln!("tup: '{project}' is already running on {dest} — stop it there first");
+        exit(1);
+    }
+    let src_dir = project_dir(project);
+    let s = format!("{}/", src_dir.join("root").display());
     let remote_root = format!("{dest}:.tup/{project}/root/");
 
     ssh(dest, &format!("mkdir -p .tup/{project}/root"));
     run_rsync(&["-a", "--delete", "-e", "ssh", &s, &remote_root]);
 
-    let src_svc = project_dir(project).join("services");
+    let src_svc = src_dir.join("services");
     if src_svc.exists() {
         if let Some(svc) = src_svc.to_str() {
             run_rsync(&["-a", "-e", "ssh", svc, &format!("{dest}:.tup/{project}/services")]);
         }
     }
-    eprintln!("[tup] shipped root: {project} -> {dest}");
+    let net = read_net_label(project);
+    let netf = src_dir.join("net");
+    if netf.exists() {
+        if let Some(nf) = netf.to_str() {
+            run_rsync(&["-a", "-e", "ssh", nf, &format!("{dest}:.tup/{project}/net")]);
+        }
+    }
+    eprintln!("[tup] shipped root: {project} -> {dest} (net={net})");
 
-    let up = format!("setsid nohup tup up {project} > .tup/{project}/up.log 2>&1 < /dev/null &");
+    let up = format!("setsid nohup tup up --net {net} {project} > .tup/{project}/up.log 2>&1 < /dev/null &");
     ssh(dest, &up);
     eprintln!("[tup] requested start on {dest}; confirm with: ssh {dest} tup preflight {project}");
 }
@@ -915,6 +1014,9 @@ COMMANDS:
     --net pasta  (default) dedicated netns, own loopback, NAT egress via pasta
     --net host   share the host network namespace
     --net none   isolated netns, loopback only, no egress
+    --harden     drop all capabilities (--cap-drop ALL) + new session (TTY-injection
+                 proof). We don't advertise security; this just lowers the escape stakes.
+                 (non-root uid, seccomp, cgroup mem/pids limits: planned, see DESIGN.md)
 
 Services are declared in ~/.tup/<project>/services, one directive per line:
     start <name> <shell command>

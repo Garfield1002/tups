@@ -205,3 +205,31 @@ Everything except the move round-trip is assembling known-good parts. Prove the 
 | Q8 | Common tools in the prologue; the real rule is the **three-lever discipline** (avoid imperative-into-mutable). |
 | Q9 | Undeclared processes **ephemeral** (SIGTERM→wait→kill) with a **move-preflight warning**; declared services use hooks; durable state in persist. |
 | Q10 | **Model A** — agent inside, session = one mobile object, user reattaches. Model B deferred. |
+
+## Security posture & hardening
+
+tup is a blast-radius boundary, **not** a security sandbox (see Goals & non-goals).
+Measured on a root-mapped deployment: no seccomp, full caps in the userns, container-root
+mapped to host-root (`uid_map 0 0 1`). What that contains vs. doesn't:
+
+- **Contains:** unbound host paths, host processes (pid ns), host ports/loopback (net ns);
+  writes outside bound paths are ephemeral. `NoNewPrivs=1` blocks setuid escalation.
+- **Does NOT contain (adversarial):** kernel escape via the unfiltered syscall surface
+  (as real root where root-mapped); resource-exhaustion DoS (no cgroup caps); exfiltration
+  (egress is open by design); tampering with bound-rw paths — the project, `~/.claude`
+  (including `.credentials.json`), and the grovy control socket.
+
+`--harden` (opt-in on `tup run`/`tup up`) applies the two always-correct bwrap flags:
+- `--cap-drop ALL` — the sandboxed process keeps no capabilities, so an escape lands with
+  an empty cap set even when root-mapped (the highest-value, zero-cost mitigation).
+- `--new-session` — `setsid`, blocking TIOCSTI terminal injection into the parent.
+
+**Planned hardening** (deliberately not shipped blind — each needs in-container build + test
+in the target's uid/systemd setup):
+- **non-root uid** (`--uid`/`--gid`) — needs a userns uid map wider than the single mapped
+  uid; environment-dependent, and bound-rw files must be owned by that uid.
+- **seccomp** (`--seccomp`) — needs a BPF profile, and since pasta does not pass fds to its
+  child, bwrap's `--seccomp FD` only works under `--net host|none` without extra plumbing.
+- **cgroup `memory.max`/`pids.max`** — cleanest via `systemd-run --scope -p MemoryMax/TasksMax`
+  rather than manual cgroup v2 writes (the no-internal-processes rule bites under a managed
+  scope); depends on the target's systemd/delegation.

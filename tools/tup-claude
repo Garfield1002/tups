@@ -18,7 +18,11 @@
 #   TUP_SESSION_BINDS extra bind args, e.g. "--bind /data --ro-bind /opt/x"
 set -eu
 
-TUP="${TUP_BIN:-tup}"
+# grovy starts sessions in tmux, whose panes don't inherit grovyd's environment, so
+# TUP_BIN is usually unset here: fall back to tup on PATH, then this repo's build.
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+TUP="${TUP_BIN:-$(command -v tup || echo "$HERE/../target/release/tup")}"
+[ -x "$TUP" ] || { echo "tup-claude: tup not found at $TUP (set TUP_BIN)" >&2; exit 127; }
 REAL_CLAUDE="${TUP_REAL_CLAUDE:-$(command -v claude || true)}"
 [ -n "$REAL_CLAUDE" ] || { echo "tup-claude: real claude not found (set TUP_REAL_CLAUDE)" >&2; exit 127; }
 REAL_CLAUDE="$(readlink -f "$REAL_CLAUDE")"
@@ -34,6 +38,10 @@ addro() { [ -e "$1" ] && binds="$binds --ro-bind $1" || true; }
 
 add   "$CWD"                       # the project working tree (rw)
 add   "$CLAUDE_CFG"                # claude config / auth / transcripts (rw)
+# claude's main config file (onboarding state, settings, project trust). It lives
+# outside ~/.claude unless CLAUDE_CONFIG_DIR is set; without it claude starts as a
+# fresh install and stops at the theme picker.
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then add "$CLAUDE_CONFIG_DIR/.claude.json"; else add "$HOME/.claude.json"; fi
 [ -n "${GROVY_STATE_DIR:-}" ] && add "$GROVY_STATE_DIR"   # grovy unix socket + settings (rw)
 addro "$(dirname "$REAL_CLAUDE")"  # the claude binary's directory
 case "$REAL_CLAUDE" in             # the whole claude data dir (…/share/claude), if that's the layout

@@ -107,7 +107,7 @@ fn push3(a: &mut Vec<OsString>, flag: &str, x: impl Into<OsString>, y: impl Into
 
 /// Build bwrap's argument vector (everything up to, but not including, the trailing
 /// `--` and the command).
-fn bwrap_args(root: &Path, project: &str, net: Net) -> Vec<OsString> {
+fn bwrap_args(root: &Path, project: &str, net: Net, chdir: &str) -> Vec<OsString> {
     let mut a: Vec<OsString> = Vec::new();
     for s in [
         "--unshare-user",
@@ -150,7 +150,7 @@ fn bwrap_args(root: &Path, project: &str, net: Net) -> Vec<OsString> {
         a.push(dest.into());
     }
     a.push("--chdir".into());
-    a.push("/work".into());
+    a.push(chdir.into());
     push3(&mut a, "--setenv", "TUP_PROJECT", project);
     push3(&mut a, "--setenv", "TUP_NET", net.label());
     // DNS relay for the isolated netns.
@@ -168,10 +168,11 @@ fn assemble(
     root: &Path,
     project: &str,
     net: Net,
+    chdir: &str,
     extra_bwrap: Vec<OsString>,
     inner: Vec<OsString>,
 ) -> Command {
-    let mut bw = bwrap_args(root, project, net);
+    let mut bw = bwrap_args(root, project, net, chdir);
     bw.extend(extra_bwrap);
     bw.push("--".into());
     bw.extend(inner);
@@ -230,22 +231,75 @@ fn cmd_run(args: &[String]) {
         Some(p) => (&args[..p], args[p + 1..].to_vec()),
         None => (args, Vec::new()),
     };
-    let (net, rest) = parse_net(opts);
-    if rest.is_empty() {
-        eprintln!("usage: tup run [--net pasta|host|none] <project> [-- <cmd...>]");
-        exit(2);
+
+    // Parse options: --net, --bind (rw), --ro-bind, --chdir, then the positional project.
+    let mut net = Net::Pasta;
+    let mut chdir: Option<String> = None;
+    let mut extra: Vec<OsString> = Vec::new();
+    let mut project: Option<String> = None;
+    let mut i = 0;
+    while i < opts.len() {
+        match opts[i].as_str() {
+            "--net" => {
+                net = match opts.get(i + 1).map(String::as_str) {
+                    Some("pasta") => Net::Pasta,
+                    Some("host") => Net::Host,
+                    Some("none") => Net::None,
+                    other => {
+                        eprintln!("tup: unknown --net '{}'", other.unwrap_or(""));
+                        exit(2);
+                    }
+                };
+                i += 2;
+            }
+            "--bind" | "--ro-bind" => {
+                let flag = if opts[i] == "--bind" { "--bind" } else { "--ro-bind" };
+                match opts.get(i + 1) {
+                    Some(p) => push3(&mut extra, flag, p.clone(), p.clone()),
+                    None => {
+                        eprintln!("tup: {} needs a path", opts[i]);
+                        exit(2);
+                    }
+                }
+                i += 2;
+            }
+            "--chdir" => {
+                chdir = opts.get(i + 1).cloned();
+                if chdir.is_none() {
+                    eprintln!("tup: --chdir needs a path");
+                    exit(2);
+                }
+                i += 2;
+            }
+            _ => {
+                if project.is_none() {
+                    project = Some(opts[i].clone());
+                } else {
+                    eprintln!("tup: unexpected argument '{}'", opts[i]);
+                    exit(2);
+                }
+                i += 1;
+            }
+        }
     }
-    let project = &rest[0];
+    let project = match project {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: tup run [--net M] [--bind P] [--ro-bind P] [--chdir P] <project> [-- <cmd>]");
+            exit(2);
+        }
+    };
     let cmd = if cmd.is_empty() {
         vec!["/bin/bash".to_string()]
     } else {
         cmd
     };
-    let root = ensure_project_root(project);
+    let root = ensure_project_root(&project);
+    let chdir = chdir.unwrap_or_else(|| "/work".to_string());
     let inner: Vec<OsString> = cmd.iter().map(OsString::from).collect();
 
-    eprintln!("[tup] run project={project} net={}", net.label());
-    let mut c = assemble(&root, project, net, vec![], inner);
+    eprintln!("[tup] run project={project} net={} chdir={chdir}", net.label());
+    let mut c = assemble(&root, &project, net, &chdir, extra, inner);
     match c.status() {
         Ok(status) => exit(status.code().unwrap_or(1)),
         Err(e) => {
@@ -348,7 +402,7 @@ fn cmd_up(args: &[String]) {
         .map(OsString::from)
         .collect();
 
-    let mut c = assemble(&root, project, net, extra, inner);
+    let mut c = assemble(&root, project, net, "/work", extra, inner);
     install_forwarders();
     eprintln!("[tup] up project={project} net={} (PID-1 supervisor)", net.label());
     let mut child = match c.spawn() {

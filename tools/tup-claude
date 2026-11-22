@@ -1,0 +1,45 @@
+#!/bin/sh
+# tup-claude — run `claude` inside a tupperware container, for grovy.
+#
+# grovy launches a session as:  $GROVY_CLAUDE --settings <file> [extra...]  in the
+# project dir, with GROVY_SESSION / GROVY_STATE_DIR / PYTHONPATH in the environment.
+# Point grovy at this wrapper to containerize sessions (opt-in, reversible):
+#
+#     GROVY_CLAUDE=/path/to/tupperware/tools/tup-claude
+#
+# It binds the project tree, ~/.claude, the grovy state dir (whose Unix socket the
+# hooks talk to — a filesystem object, so it crosses the netns), the claude binary,
+# and the grovy python libs, then runs claude under `tup` with pasta egress.
+#
+# Env knobs:
+#   TUP_BIN           path to the `tup` binary        (default: tup on PATH)
+#   TUP_REAL_CLAUDE   the real claude binary          (default: `claude` on PATH)
+#   TUP_NET           net mode: pasta|host|none       (default: pasta)
+#   TUP_SESSION_BINDS extra bind args, e.g. "--bind /data --ro-bind /opt/x"
+set -eu
+
+TUP="${TUP_BIN:-tup}"
+REAL_CLAUDE="${TUP_REAL_CLAUDE:-$(command -v claude || true)}"
+[ -n "$REAL_CLAUDE" ] || { echo "tup-claude: real claude not found (set TUP_REAL_CLAUDE)" >&2; exit 127; }
+REAL_CLAUDE="$(readlink -f "$REAL_CLAUDE")"
+
+PROJECT="${GROVY_SESSION:-session}"
+CWD="$PWD"
+CLAUDE_CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+NET="${TUP_NET:-pasta}"
+
+binds=""
+add()   { [ -e "$1" ] && binds="$binds --bind $1" || true; }
+addro() { [ -e "$1" ] && binds="$binds --ro-bind $1" || true; }
+
+add   "$CWD"                       # the project working tree (rw)
+add   "$CLAUDE_CFG"                # claude config / auth / transcripts (rw)
+[ -n "${GROVY_STATE_DIR:-}" ] && add "$GROVY_STATE_DIR"   # grovy unix socket + settings (rw)
+addro "$(dirname "$REAL_CLAUDE")"  # the claude binary's directory
+addro "$HOME/.local/bin"           # the claude symlink, if present
+oldifs=$IFS; IFS=:                 # grovy python libs for the hooks (PYTHONPATH)
+for d in ${PYTHONPATH:-}; do addro "$d"; done
+IFS=$oldifs
+
+# shellcheck disable=SC2086
+exec "$TUP" run --net "$NET" $binds ${TUP_SESSION_BINDS:-} --chdir "$CWD" "$PROJECT" -- "$REAL_CLAUDE" "$@"

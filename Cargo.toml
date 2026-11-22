@@ -1,11 +1,11 @@
 [package]
-name = "bags"
+name = "tupperware"
 version = "0.0.1"
 edition = "2021"
-description = "Ultra-micro containers for coding agents: contain the blast radius, move the session."
+description = "tupperware: small, weak, movable containers for coding agents — contain the blast radius, move the session."
 
 [[bin]]
-name = "bags"
+name = "tup"
 path = "src/main.rs"
 
 [profile.release]

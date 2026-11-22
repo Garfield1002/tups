@@ -1,4 +1,4 @@
-# bags — ultra-micro containers for coding agents
+# tup — ultra-micro containers for coding agents
 
 > Contain the blast radius of a coding agent, and move its session between servers —
 > while sharing binaries and libraries across all projects.
@@ -42,7 +42,7 @@ A **project** gets three namespaces and a shared store:
 The env *is* the project's `flake.nix`. `flake.lock` pins by hash, the store dedups, a binary
 cache ships paths by hash to other servers. We do **not** build an abstraction over flakes —
 agents author the flake, the user never has to read it. The only thing a flake doesn't model
-(links / network / persist) lives as **plain data in a flake output: `outputs.bags = { ... }`**.
+(links / network / persist) lives as **plain data in a flake output: `outputs.tup = { ... }`**.
 One source of truth, one evaluator (Nix), no second format.
 
 ### Prologues
@@ -78,7 +78,7 @@ the manifest only **overrides**.
 A project may link paths into its root. Links are **typed by target** so movability is visible:
 
 1. **Store path** (content-addressed) → fully movable, fetched by hash. ✅
-2. **Another bags project** (by project identity, not a fs path) → a first-class, movable
+2. **Another tup project** (by project identity, not a fs path) → a first-class, movable
    inter-project dependency; also how two sessions share. Links a **declared output** of the
    producer, *not* its raw working tree (so a move doesn't drag two mutable trees in lockstep).
 3. **Arbitrary host path** (`/data/corpus`) → allowed, but **marks the project host-pinned**
@@ -106,7 +106,7 @@ At that instant the resumable state is small:
    - undeclared processes → SIGTERM → wait → kill  (ephemeral, no state promise)
 3. Snapshot persist volumes + working-tree delta.
 4. Ship:  store paths by hash (fetched on target, never sent) + rsync the mutable delta over SSH.
-5. On target: `bags up`  → fetch/rebuild env by hash, restore persist, relaunch declared services.
+5. On target: `tup up`  → fetch/rebuild env by hash, restore persist, relaunch declared services.
 6. Agent resumes its loop (sees nothing). User's roaming client reattaches (mosh-style blip).
 ```
 
@@ -146,12 +146,12 @@ the target agent can honor it.
 
 ## Components & stack
 
-- **`bags` CLI** (Rust, single static binary) — verb surface: `init`, `up`, `run`, `ps`,
+- **`tup` CLI** (Rust, single static binary) — verb surface: `init`, `up`, `run`, `ps`,
   `move`, `attach`, `preflight`.
-- **`bags init`** — the in-container **PID 1 / supervisor** (same binary, different mode). Holds
+- **`tup init`** — the in-container **PID 1 / supervisor** (same binary, different mode). Holds
   the namespaces open, starts/reaps declared services, handles the quiesce signal. *This is the
   runtime.* It is per-container, **not** a system daemon.
-- **No persistent host daemon** (MVP). Migration = **SSH + rsync**; the target runs `bags up`.
+- **No persistent host daemon** (MVP). Migration = **SSH + rsync**; the target runs `tup up`.
   Roaming reattach = `nsenter` / ssh reconnect. A host daemon only earns its place later for
   fleet/discovery (Model B).
 - **Isolation:** `bwrap` (rootless user+pid+mount ns + binds) + **`pasta`**/`slirp4netns`
@@ -172,9 +172,9 @@ sessions.
 Everything except the move round-trip is assembling known-good parts. Prove the thesis first:
 
 > A dummy agent (`loop: read instruction → edit a file → idle`) running as PID 1's child in a
-> bags container with a shared store bind-mounted and its own netns, plus **one declared
+> tup container with a shared store bind-mounted and its own netns, plus **one declared
 > service** (a trivial HTTP server holding a counter in a persist file). Then
-> `bags move host-A → host-B`: quiesce at the loop boundary, rsync persist + working tree,
+> `tup move host-A → host-B`: quiesce at the loop boundary, rsync persist + working tree,
 > relaunch the service, roaming client reattaches.
 >
 > **Question it answers:** does the agent resume with zero visible loss, and does the user's
@@ -183,13 +183,13 @@ Everything except the move round-trip is assembling known-good parts. Prove the 
 
 ### Increments
 
-1. **`bags run <project> -- <cmd>`** — assemble a namespace (shared ro system layer + dedicated
+1. **`tup run <project> -- <cmd>`** — assemble a namespace (shared ro system layer + dedicated
    rw root + pid ns) and run a command inside. *(this commit)*
-2. **`bags init` as PID 1** — supervisor, declared services, clean quiesce/reap.
+2. **`tup init` as PID 1** — supervisor, declared services, clean quiesce/reap.
 3. **Network** — `pasta` wiring: own netns, loopback, NAT egress.
 4. **Persist volumes + working-tree model** — the move payload boundary.
-5. **`bags move` + `bags preflight`** — the between-turn migration round-trip over SSH.
-6. **`bags attach`** — roaming client reattach.
+5. **`tup move` + `tup preflight`** — the between-turn migration round-trip over SSH.
+6. **`tup attach`** — roaming client reattach.
 7. **Nix env integration** — flake eval → store paths → bind-mount; prologues.
 
 ## Decision log (what the grilling settled)
@@ -198,10 +198,10 @@ Everything except the move round-trip is assembling known-good parts. Prove the 
 |---|---|
 | Q1/Q2 | Between-turn migration only; **no CRIU**. State = conversation + working tree + flake ref. |
 | Q3 | Derived state **content-addressed & shared**; **infer by default**, manifest overrides. |
-| Q4 | Env = **flake**; container config = **`outputs.bags`** data; no second format. Shared base prologue + language prologues. |
+| Q4 | Env = **flake**; container config = **`outputs.tup`** data; no second format. Shared base prologue + language prologues. |
 | Q5 | **Pin prologues/deps per project by hash**; dedup provides "shared"; fleet-bump is a convenience. |
 | Q6 | Per-project **netns**: sibling isolation + move-invariant addressing; **egress open**; no policy. |
-| Q7 | **Typed links** (store / bags-project / host-pins); `ro` default, `rw` opt-in; accidents not malice. |
+| Q7 | **Typed links** (store / tup-project / host-pins); `ro` default, `rw` opt-in; accidents not malice. |
 | Q8 | Common tools in the prologue; the real rule is the **three-lever discipline** (avoid imperative-into-mutable). |
 | Q9 | Undeclared processes **ephemeral** (SIGTERM→wait→kill) with a **move-preflight warning**; declared services use hooks; durable state in persist. |
 | Q10 | **Model A** — agent inside, session = one mobile object, user reattaches. Model B deferred. |

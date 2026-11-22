@@ -1,7 +1,7 @@
-//! bags — ultra-micro containers for coding agents.
+//! tup — ultra-micro containers for coding agents.
 //!
-//! Increment 1: `bags run`  — one-shot command in an isolated namespace.
-//! Increment 2: `bags up`/`bags init` — PID-1 supervisor that owns the process tree.
+//! Increment 1: `tup run`  — one-shot command in an isolated namespace.
+//! Increment 2: `tup up`/`tup init` — PID-1 supervisor that owns the process tree.
 //! Increment 3: per-project network namespace via pasta — own loopback, move-invariant
 //!   internal addressing, open NAT egress.
 //!
@@ -14,7 +14,7 @@
 //!
 //! Slice shortcuts still open (see DESIGN.md "Increments"):
 //!   - root is the shared host /usr, not a Nix closure; dedicated root = increment 4/7
-//!   - services manifest is a line format standing in for the flake `outputs.bags`
+//!   - services manifest is a line format standing in for the flake `outputs.tup`
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -58,10 +58,10 @@ fn main() {
         "move" => cmd_move(&args[2..]),
         "preflight" => cmd_preflight(&args[2..]),
         "ps" | "attach" => stub(&args[1]),
-        "version" | "--version" | "-V" => println!("bags {VERSION}"),
+        "version" | "--version" | "-V" => println!("tup {VERSION}"),
         "help" | "--help" | "-h" => print_help(),
         other => {
-            eprintln!("bags: unknown command '{other}'\n");
+            eprintln!("tup: unknown command '{other}'\n");
             print_help();
             exit(2);
         }
@@ -74,17 +74,17 @@ fn main() {
 
 fn project_dir(project: &str) -> PathBuf {
     let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(".bags").join(project)
+    PathBuf::from(home).join(".tup").join(project)
 }
 
 fn ensure_project_root(project: &str) -> PathBuf {
     if project.is_empty() || project.contains('/') || project == "." || project == ".." {
-        eprintln!("bags: invalid project name '{project}'");
+        eprintln!("tup: invalid project name '{project}'");
         exit(2);
     }
     let root = project_dir(project).join("root");
     if let Err(e) = fs::create_dir_all(&root) {
-        eprintln!("bags: cannot create {}: {e}", root.display());
+        eprintln!("tup: cannot create {}: {e}", root.display());
         exit(1);
     }
     root
@@ -151,8 +151,8 @@ fn bwrap_args(root: &Path, project: &str, net: Net) -> Vec<OsString> {
     }
     a.push("--chdir".into());
     a.push("/work".into());
-    push3(&mut a, "--setenv", "BAGS_PROJECT", project);
-    push3(&mut a, "--setenv", "BAGS_NET", net.label());
+    push3(&mut a, "--setenv", "TUP_PROJECT", project);
+    push3(&mut a, "--setenv", "TUP_NET", net.label());
     // DNS relay for the isolated netns.
     if net == Net::Pasta {
         let resolv = ensure_resolv(project);
@@ -208,7 +208,7 @@ fn parse_net(args: &[String]) -> (Net, Vec<String>) {
                 Some("host") => Net::Host,
                 Some("none") => Net::None,
                 other => {
-                    eprintln!("bags: unknown --net '{}'", other.unwrap_or(""));
+                    eprintln!("tup: unknown --net '{}'", other.unwrap_or(""));
                     exit(2);
                 }
             };
@@ -222,7 +222,7 @@ fn parse_net(args: &[String]) -> (Net, Vec<String>) {
 }
 
 // ---------------------------------------------------------------------------
-// bags run — one-shot command
+// tup run — one-shot command
 // ---------------------------------------------------------------------------
 
 fn cmd_run(args: &[String]) {
@@ -232,7 +232,7 @@ fn cmd_run(args: &[String]) {
     };
     let (net, rest) = parse_net(opts);
     if rest.is_empty() {
-        eprintln!("usage: bags run [--net pasta|host|none] <project> [-- <cmd...>]");
+        eprintln!("usage: tup run [--net pasta|host|none] <project> [-- <cmd...>]");
         exit(2);
     }
     let project = &rest[0];
@@ -244,25 +244,25 @@ fn cmd_run(args: &[String]) {
     let root = ensure_project_root(project);
     let inner: Vec<OsString> = cmd.iter().map(OsString::from).collect();
 
-    eprintln!("[bags] run project={project} net={}", net.label());
+    eprintln!("[tup] run project={project} net={}", net.label());
     let mut c = assemble(&root, project, net, vec![], inner);
     match c.status() {
         Ok(status) => exit(status.code().unwrap_or(1)),
         Err(e) => {
-            eprintln!("bags: failed to launch container: {e}");
+            eprintln!("tup: failed to launch container: {e}");
             exit(1);
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// bags up — launch a supervised container (host side)
+// tup up — launch a supervised container (host side)
 // ---------------------------------------------------------------------------
 
 static CHILD_PID: AtomicI32 = AtomicI32::new(-1); // direct child (pasta or bwrap), fallback
 static INIT_PID: AtomicI32 = AtomicI32::new(-1); // sandbox PID 1, host-visible pid
 
-/// Forward a terminating signal to the sandbox PID 1 directly, so `bags init` runs its
+/// Forward a terminating signal to the sandbox PID 1 directly, so `tup init` runs its
 /// quiesce. Never signal the monitor — that triggers pdeathsig SIGKILL and skips quiesce.
 extern "C" fn forward_term(_sig: libc::c_int) {
     let p = INIT_PID.load(Ordering::SeqCst);
@@ -288,7 +288,7 @@ fn install_forwarders() {
     }
 }
 
-/// Find the host-visible pid of a project's `bags init` by matching its cmdline.
+/// Find the host-visible pid of a project's `tup init` by matching its cmdline.
 fn find_init_pid(project: &str) -> Option<i32> {
     let rd = fs::read_dir("/proc").ok()?;
     for e in rd.flatten() {
@@ -302,7 +302,7 @@ fn find_init_pid(project: &str) -> Option<i32> {
         };
         let parts: Vec<&[u8]> = data.split(|b| *b == 0).filter(|s| !s.is_empty()).collect();
         if parts.len() >= 3
-            && parts[0] == b"/run/bags"
+            && parts[0] == b"/run/tup"
             && parts[1] == b"init"
             && parts[2] == project.as_bytes()
         {
@@ -325,53 +325,53 @@ fn poll_init_pid(project: &str, tries: u32) -> Option<i32> {
 fn cmd_up(args: &[String]) {
     let (net, rest) = parse_net(args);
     if rest.is_empty() {
-        eprintln!("usage: bags up [--net pasta|host|none] <project>");
+        eprintln!("usage: tup up [--net pasta|host|none] <project>");
         exit(2);
     }
     let project = &rest[0];
     let root = ensure_project_root(project);
     let exe = env::current_exe().unwrap_or_else(|e| {
-        eprintln!("bags: cannot find own path: {e}");
+        eprintln!("tup: cannot find own path: {e}");
         exit(1);
     });
     let services_file = project_dir(project).join("services");
 
     let mut extra: Vec<OsString> = Vec::new();
-    push3(&mut extra, "--ro-bind", exe, "/run/bags");
+    push3(&mut extra, "--ro-bind", exe, "/run/tup");
     if services_file.exists() {
-        push3(&mut extra, "--ro-bind", services_file, "/run/bags.services");
+        push3(&mut extra, "--ro-bind", services_file, "/run/tup.services");
     }
     extra.push("--as-pid-1".into());
 
-    let inner: Vec<OsString> = ["/run/bags", "init", project]
+    let inner: Vec<OsString> = ["/run/tup", "init", project]
         .iter()
         .map(OsString::from)
         .collect();
 
     let mut c = assemble(&root, project, net, extra, inner);
     install_forwarders();
-    eprintln!("[bags] up project={project} net={} (PID-1 supervisor)", net.label());
+    eprintln!("[tup] up project={project} net={} (PID-1 supervisor)", net.label());
     let mut child = match c.spawn() {
         Ok(ch) => ch,
         Err(e) => {
-            eprintln!("bags: failed to launch container: {e}");
+            eprintln!("tup: failed to launch container: {e}");
             exit(1);
         }
     };
     CHILD_PID.store(child.id() as i32, Ordering::SeqCst);
     match poll_init_pid(project, 100) {
         Some(p) => INIT_PID.store(p, Ordering::SeqCst),
-        None => eprintln!("[bags] warning: could not locate init pid; shutdown may be abrupt"),
+        None => eprintln!("[tup] warning: could not locate init pid; shutdown may be abrupt"),
     }
     let status = child.wait().unwrap_or_else(|e| {
-        eprintln!("bags: wait failed: {e}");
+        eprintln!("tup: wait failed: {e}");
         exit(1);
     });
     exit(status.code().unwrap_or(0));
 }
 
 // ---------------------------------------------------------------------------
-// bags init — PID 1 supervisor (inside the container)
+// tup init — PID 1 supervisor (inside the container)
 // ---------------------------------------------------------------------------
 
 struct Service {
@@ -382,7 +382,7 @@ struct Service {
 
 fn cmd_init(args: &[String]) {
     let project = args.first().map(String::as_str).unwrap_or("?");
-    let services = load_services("/run/bags.services");
+    let services = load_services("/run/tup.services");
     let sfd = setup_signalfd();
 
     let mut running: HashMap<i32, String> = HashMap::new();
@@ -391,15 +391,15 @@ fn cmd_init(args: &[String]) {
             match spawn_shell(start) {
                 Ok(pid) => {
                     running.insert(pid as i32, s.name.clone());
-                    eprintln!("[bags init] started '{}' (pid {pid})", s.name);
+                    eprintln!("[tup init] started '{}' (pid {pid})", s.name);
                 }
-                Err(e) => eprintln!("[bags init] failed to start '{}': {e}", s.name),
+                Err(e) => eprintln!("[tup init] failed to start '{}': {e}", s.name),
             }
         }
     }
     let self_pid = unsafe { libc::getpid() };
     eprintln!(
-        "[bags init] project={project} pid={self_pid} supervising {} service(s)",
+        "[tup init] project={project} pid={self_pid} supervising {} service(s)",
         running.len()
     );
 
@@ -429,7 +429,7 @@ fn load_services(path: &str) -> Vec<Service> {
         let (kw, r1) = split_first(line);
         let (name, cmd) = split_first(r1);
         if name.is_empty() {
-            eprintln!("[bags init] ignoring malformed manifest line: {line}");
+            eprintln!("[tup init] ignoring malformed manifest line: {line}");
             continue;
         }
         let idx = match svcs.iter().position(|s| s.name == name) {
@@ -446,7 +446,7 @@ fn load_services(path: &str) -> Vec<Service> {
         match kw {
             "start" => svcs[idx].start = Some(cmd.to_string()),
             "stop" => svcs[idx].stop = Some(cmd.to_string()),
-            other => eprintln!("[bags init] unknown manifest keyword '{other}'"),
+            other => eprintln!("[tup init] unknown manifest keyword '{other}'"),
         }
     }
     svcs
@@ -469,7 +469,7 @@ fn setup_signalfd() -> i32 {
         libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
         let fd = libc::signalfd(-1, &mask, libc::SFD_CLOEXEC);
         if fd < 0 {
-            eprintln!("[bags init] signalfd failed");
+            eprintln!("[tup init] signalfd failed");
             exit(1);
         }
         fd
@@ -510,7 +510,7 @@ fn reap(running: &mut HashMap<i32, String>) {
         }
         if let Some(name) = running.remove(&pid) {
             eprintln!(
-                "[bags init] service '{name}' (pid {pid}) exited: {}",
+                "[tup init] service '{name}' (pid {pid}) exited: {}",
                 describe_status(status)
             );
         }
@@ -528,10 +528,10 @@ fn describe_status(status: i32) -> String {
 }
 
 fn quiesce(services: &[Service], running: &HashMap<i32, String>) {
-    eprintln!("[bags init] quiescing");
+    eprintln!("[tup init] quiescing");
     for s in services {
         if let Some(stop) = &s.stop {
-            eprintln!("[bags init] stop hook: '{}'", s.name);
+            eprintln!("[tup init] stop hook: '{}'", s.name);
             if let Ok(pid) = spawn_shell(stop) {
                 wait_bounded(pid as i32, 5000);
             }
@@ -547,7 +547,7 @@ fn quiesce(services: &[Service], running: &HashMap<i32, String>) {
             .collect::<Vec<_>>()
             .join(", ");
         eprintln!(
-            "[bags init] WARNING: {} process(es) beyond declared service entrypoints were running: {list}",
+            "[tup init] WARNING: {} process(es) beyond declared service entrypoints were running: {list}",
             others.len()
         );
     }
@@ -563,7 +563,7 @@ fn quiesce(services: &[Service], running: &HashMap<i32, String>) {
     }
     unsafe { libc::kill(-1, libc::SIGKILL) };
     reap(&mut discard);
-    eprintln!("[bags init] stopped cleanly");
+    eprintln!("[tup init] stopped cleanly");
 }
 
 fn wait_bounded(pid: i32, ms: u64) {
@@ -613,7 +613,7 @@ fn only_init_left() -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// bags preflight / bags move — the between-turn migration
+// tup preflight / tup move — the between-turn migration
 // ---------------------------------------------------------------------------
 
 /// The move payload for the prototype is the dedicated rw root (the working tree +
@@ -678,7 +678,7 @@ fn preflight_report(project: &str) {
 
 fn cmd_preflight(args: &[String]) {
     if args.is_empty() {
-        eprintln!("usage: bags preflight <project>");
+        eprintln!("usage: tup preflight <project>");
         exit(2);
     }
     preflight_report(&args[0]);
@@ -704,7 +704,7 @@ fn spawn_detached(program: &Path, args: &[String], log: &Path) -> bool {
     let f = match File::create(log) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("bags: cannot create log {}: {e}", log.display());
+            eprintln!("tup: cannot create log {}: {e}", log.display());
             return false;
         }
     };
@@ -727,11 +727,11 @@ fn run_rsync(args: &[&str]) {
     match Command::new("rsync").args(args).status() {
         Ok(s) if s.success() => {}
         Ok(s) => {
-            eprintln!("bags: rsync failed ({s})");
+            eprintln!("tup: rsync failed ({s})");
             exit(1);
         }
         Err(e) => {
-            eprintln!("bags: rsync error: {e} (is rsync installed?)");
+            eprintln!("tup: rsync error: {e} (is rsync installed?)");
             exit(1);
         }
     }
@@ -739,7 +739,7 @@ fn run_rsync(args: &[&str]) {
 
 fn cmd_move(args: &[String]) {
     if args.len() < 2 {
-        eprintln!("usage: bags move <project> <local:<newproject> | [user@]host>");
+        eprintln!("usage: tup move <project> <local:<newproject> | [user@]host>");
         exit(2);
     }
     let project = &args[0];
@@ -750,13 +750,13 @@ fn cmd_move(args: &[String]) {
     // Quiesce the source at the (simulated) turn boundary: signal PID 1 directly and
     // wait for the container to tear down, so stop hooks flush state into the root.
     if let Some(pid) = find_init_pid(project) {
-        eprintln!("[bags] quiescing source (init pid {pid})");
+        eprintln!("[tup] quiescing source (init pid {pid})");
         unsafe { libc::kill(pid, libc::SIGTERM) };
         if !wait_for_gone(pid, 10_000) {
-            eprintln!("[bags] warning: source still running after 10s; shipping anyway");
+            eprintln!("[tup] warning: source still running after 10s; shipping anyway");
         }
     } else {
-        eprintln!("[bags] source not running; shipping current on-disk state");
+        eprintln!("[tup] source not running; shipping current on-disk state");
     }
 
     match dest.strip_prefix("local:") {
@@ -767,7 +767,7 @@ fn cmd_move(args: &[String]) {
 
 fn local_move(project: &str, newproj: &str) {
     if newproj.is_empty() || newproj.contains('/') {
-        eprintln!("bags: invalid target project '{newproj}'");
+        eprintln!("tup: invalid target project '{newproj}'");
         exit(2);
     }
     let src_root = project_dir(project).join("root");
@@ -783,46 +783,46 @@ fn local_move(project: &str, newproj: &str) {
     if src_svc.exists() {
         let _ = fs::copy(&src_svc, dst_dir.join("services"));
     }
-    eprintln!("[bags] shipped root: {project} -> {newproj}");
+    eprintln!("[tup] shipped root: {project} -> {newproj}");
 
     // Bring the project up on the "target" (same host, new root) and confirm it resumed.
-    let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("bags"));
+    let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("tup"));
     let log = dst_dir.join("up.log");
     spawn_detached(&exe, &["up".to_string(), newproj.to_string()], &log);
     match poll_init_pid(newproj, 150) {
-        Some(p) => eprintln!("[bags] resumed as '{newproj}' (init pid {p}); log {}", log.display()),
-        None => eprintln!("[bags] warning: '{newproj}' did not come up; see {}", log.display()),
+        Some(p) => eprintln!("[tup] resumed as '{newproj}' (init pid {p}); log {}", log.display()),
+        None => eprintln!("[tup] warning: '{newproj}' did not come up; see {}", log.display()),
     }
 }
 
 fn remote_move(project: &str, dest: &str) {
-    // Ship to ~/.bags/<project> on the remote (rsync remote paths are relative to $HOME),
-    // then start it there detached. Assumes `bags` is on PATH on the remote.
+    // Ship to ~/.tup/<project> on the remote (rsync remote paths are relative to $HOME),
+    // then start it there detached. Assumes `tup` is on PATH on the remote.
     let src_root = project_dir(project).join("root");
     let s = format!("{}/", src_root.display());
-    let remote_root = format!("{dest}:.bags/{project}/root/");
+    let remote_root = format!("{dest}:.tup/{project}/root/");
 
-    ssh(dest, &format!("mkdir -p .bags/{project}/root"));
+    ssh(dest, &format!("mkdir -p .tup/{project}/root"));
     run_rsync(&["-a", "--delete", "-e", "ssh", &s, &remote_root]);
 
     let src_svc = project_dir(project).join("services");
     if src_svc.exists() {
         if let Some(svc) = src_svc.to_str() {
-            run_rsync(&["-a", "-e", "ssh", svc, &format!("{dest}:.bags/{project}/services")]);
+            run_rsync(&["-a", "-e", "ssh", svc, &format!("{dest}:.tup/{project}/services")]);
         }
     }
-    eprintln!("[bags] shipped root: {project} -> {dest}");
+    eprintln!("[tup] shipped root: {project} -> {dest}");
 
-    let up = format!("setsid nohup bags up {project} > .bags/{project}/up.log 2>&1 < /dev/null &");
+    let up = format!("setsid nohup tup up {project} > .tup/{project}/up.log 2>&1 < /dev/null &");
     ssh(dest, &up);
-    eprintln!("[bags] requested start on {dest}; confirm with: ssh {dest} bags preflight {project}");
+    eprintln!("[tup] requested start on {dest}; confirm with: ssh {dest} tup preflight {project}");
 }
 
 fn ssh(dest: &str, cmd: &str) {
     match Command::new("ssh").arg(dest).arg(cmd).status() {
         Ok(s) if s.success() => {}
-        Ok(s) => eprintln!("[bags] ssh {dest} failed ({s}): {cmd}"),
-        Err(e) => eprintln!("[bags] ssh error: {e}"),
+        Ok(s) => eprintln!("[tup] ssh {dest} failed ({s}): {cmd}"),
+        Err(e) => eprintln!("[tup] ssh error: {e}"),
     }
 }
 
@@ -832,22 +832,22 @@ fn ssh(dest: &str, cmd: &str) {
 
 fn stub(cmd: &str) {
     let planned = match cmd {
-        "ps" => "list running bags projects and their declared services",
+        "ps" => "list running tup projects and their declared services",
         "move" => "migrate a session to another host (between-turn, over SSH + rsync)",
         "attach" => "attach a roaming client to a running project",
         "preflight" => "report what a move would lose/ship (undeclared procs, host-pins, bytes)",
         _ => "planned",
     };
-    eprintln!("bags {cmd}: not implemented yet — planned: {planned}");
+    eprintln!("tup {cmd}: not implemented yet — planned: {planned}");
     exit(69);
 }
 
 fn print_help() {
     println!(
-        "bags {VERSION} — ultra-micro containers for coding agents
+        "tup {VERSION} — ultra-micro containers for coding agents
 
 USAGE:
-    bags <command> [args]
+    tup <command> [args]
 
 COMMANDS:
     run [--net M] <project> [-- <cmd>]   run a command in a project's namespace   [implemented]
@@ -862,7 +862,7 @@ COMMANDS:
     --net host   share the host network namespace
     --net none   isolated netns, loopback only, no egress
 
-Services are declared in ~/.bags/<project>/services, one directive per line:
+Services are declared in ~/.tup/<project>/services, one directive per line:
     start <name> <shell command>
     stop  <name> <shell command>   (optional clean-quiesce hook)
 

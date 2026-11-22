@@ -1,16 +1,24 @@
 //! bags — ultra-micro containers for coding agents.
 //!
 //! Increment 1: `bags run`  — one-shot command in an isolated namespace.
-//! Increment 2: `bags up`/`bags init` — a PID-1 supervisor that owns the process tree,
-//!   starts declared services, reaps orphans, and quiesces cleanly on signal.
+//! Increment 2: `bags up`/`bags init` — PID-1 supervisor that owns the process tree.
+//! Increment 3: per-project network namespace via pasta — own loopback, move-invariant
+//!   internal addressing, open NAT egress.
+//!
+//! Networking model: pasta creates the net+user namespace and runs bwrap inside it
+//! (bwrap does fs/pid/ipc/uts but not --unshare-net, inheriting pasta's isolated netns).
+//! Egress is NAT'd to the host's default route; DNS is relayed via pasta --dns-forward
+//! because the host's resolver is a loopback stub (systemd-resolved) unreachable from a
+//! fresh netns. Because pasta does not pass fds through, the sandbox PID 1 is located by
+//! scanning /proc for its cmdline rather than bwrap --info-fd.
 //!
 //! Slice shortcuts still open (see DESIGN.md "Increments"):
-//!   - host networking is shared; dedicated netns via pasta = increment 3
 //!   - root is the shared host /usr, not a Nix closure; dedicated root = increment 4/7
-//!   - services manifest is a line format standing in for the flake `outputs.bags` = increment 7
+//!   - services manifest is a line format standing in for the flake `outputs.bags`
 
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -19,6 +27,26 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// In-namespace address the guest sends DNS to; pasta intercepts and forwards it to the
+/// host resolver. Must be non-loopback (pasta rejects loopback forward addresses).
+const PASTA_DNS: &str = "169.254.0.53";
+
+#[derive(Clone, Copy, PartialEq)]
+enum Net {
+    Pasta,
+    Host,
+    None,
+}
+
+impl Net {
+    fn label(self) -> &'static str {
+        match self {
+            Net::Pasta => "pasta",
+            Net::Host => "host",
+            Net::None => "none",
+        }
+    }
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -38,50 +66,8 @@ fn main() {
 }
 
 // ---------------------------------------------------------------------------
-// shared: filesystem assembly
+// filesystem / network assembly
 // ---------------------------------------------------------------------------
-
-/// Bind the shared, read-only system layer onto a fresh container root.
-fn add_system_layer(c: &mut Command) {
-    for p in ["/usr", "/etc"] {
-        if Path::new(p).exists() {
-            c.arg("--ro-bind").arg(p).arg(p);
-        }
-    }
-    for name in ["bin", "sbin", "lib", "lib64", "libx32", "lib32"] {
-        let p = format!("/{name}");
-        match fs::symlink_metadata(&p) {
-            Ok(m) if m.file_type().is_symlink() => {
-                if let Ok(target) = fs::read_link(&p) {
-                    c.arg("--symlink").arg(target).arg(&p);
-                }
-            }
-            Ok(_) => {
-                c.arg("--ro-bind").arg(&p).arg(&p);
-            }
-            Err(_) => {}
-        }
-    }
-    if Path::new("/nix").exists() {
-        c.arg("--ro-bind").arg("/nix").arg("/nix");
-    }
-}
-
-/// Common bwrap namespace + virtual-fs flags for a project container.
-fn add_container_base(c: &mut Command, root: &Path, project: &str) {
-    c.args([
-        "--unshare-user",
-        "--unshare-pid",
-        "--unshare-ipc",
-        "--unshare-uts",
-        "--die-with-parent",
-    ]);
-    add_system_layer(c);
-    c.arg("--bind").arg(root).arg("/work");
-    c.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
-    c.args(["--chdir", "/work"]);
-    c.args(["--setenv", "BAGS_PROJECT", project]);
-}
 
 fn project_dir(project: &str) -> PathBuf {
     let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -101,41 +87,166 @@ fn ensure_project_root(project: &str) -> PathBuf {
     root
 }
 
+/// Write the per-project resolv.conf pointing at the pasta DNS relay.
+fn ensure_resolv(project: &str) -> PathBuf {
+    let dir = project_dir(project);
+    let _ = fs::create_dir_all(&dir);
+    let p = dir.join("resolv.conf");
+    let _ = fs::write(&p, format!("nameserver {PASTA_DNS}\n"));
+    p
+}
+
+fn push3(a: &mut Vec<OsString>, flag: &str, x: impl Into<OsString>, y: impl Into<OsString>) {
+    a.push(flag.into());
+    a.push(x.into());
+    a.push(y.into());
+}
+
+/// Build bwrap's argument vector (everything up to, but not including, the trailing
+/// `--` and the command).
+fn bwrap_args(root: &Path, project: &str, net: Net) -> Vec<OsString> {
+    let mut a: Vec<OsString> = Vec::new();
+    for s in [
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--die-with-parent",
+    ] {
+        a.push(s.into());
+    }
+    if net == Net::None {
+        a.push("--unshare-net".into()); // isolated, no egress
+    }
+    // Shared read-only system layer, on a fresh root (so we can create our own mountpoints).
+    for p in ["/usr", "/etc"] {
+        if Path::new(p).exists() {
+            push3(&mut a, "--ro-bind", p, p);
+        }
+    }
+    for name in ["bin", "sbin", "lib", "lib64", "libx32", "lib32"] {
+        let p = format!("/{name}");
+        match fs::symlink_metadata(&p) {
+            Ok(m) if m.file_type().is_symlink() => {
+                if let Ok(target) = fs::read_link(&p) {
+                    push3(&mut a, "--symlink", target, p);
+                }
+            }
+            Ok(_) => push3(&mut a, "--ro-bind", p.clone(), p),
+            Err(_) => {}
+        }
+    }
+    if Path::new("/nix").exists() {
+        push3(&mut a, "--ro-bind", "/nix", "/nix");
+    }
+    // Dedicated read-write project root.
+    push3(&mut a, "--bind", root, "/work");
+    // Fresh virtual filesystems (--proc and --tmpfs each take a single dest; --dev too).
+    for (flag, dest) in [("--proc", "/proc"), ("--dev", "/dev"), ("--tmpfs", "/tmp")] {
+        a.push(flag.into());
+        a.push(dest.into());
+    }
+    a.push("--chdir".into());
+    a.push("/work".into());
+    push3(&mut a, "--setenv", "BAGS_PROJECT", project);
+    push3(&mut a, "--setenv", "BAGS_NET", net.label());
+    // DNS relay for the isolated netns.
+    if net == Net::Pasta {
+        let resolv = ensure_resolv(project);
+        let target =
+            fs::canonicalize("/etc/resolv.conf").unwrap_or_else(|_| PathBuf::from("/etc/resolv.conf"));
+        push3(&mut a, "--ro-bind", resolv, target);
+    }
+    a
+}
+
+/// Assemble the full command: pasta(outer) + bwrap(inner) for Net::Pasta, else bwrap.
+fn assemble(
+    root: &Path,
+    project: &str,
+    net: Net,
+    extra_bwrap: Vec<OsString>,
+    inner: Vec<OsString>,
+) -> Command {
+    let mut bw = bwrap_args(root, project, net);
+    bw.extend(extra_bwrap);
+    bw.push("--".into());
+    bw.extend(inner);
+
+    match net {
+        Net::Pasta => {
+            let mut c = Command::new("pasta");
+            c.arg("--config-net")
+                .arg("--dns-forward")
+                .arg(PASTA_DNS)
+                .arg("--quiet");
+            c.arg("--").arg("bwrap");
+            c.args(&bw);
+            c
+        }
+        Net::Host | Net::None => {
+            let mut c = Command::new("bwrap");
+            c.args(&bw);
+            c
+        }
+    }
+}
+
+/// Pull an optional `--net <mode>` out of the argument list.
+fn parse_net(args: &[String]) -> (Net, Vec<String>) {
+    let mut net = Net::Pasta;
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--net" {
+            let v = args.get(i + 1).map(String::as_str);
+            net = match v {
+                Some("pasta") => Net::Pasta,
+                Some("host") => Net::Host,
+                Some("none") => Net::None,
+                other => {
+                    eprintln!("bags: unknown --net '{}'", other.unwrap_or(""));
+                    exit(2);
+                }
+            };
+            i += 2;
+        } else {
+            out.push(args[i].clone());
+            i += 1;
+        }
+    }
+    (net, out)
+}
+
 // ---------------------------------------------------------------------------
 // bags run — one-shot command
 // ---------------------------------------------------------------------------
 
 fn cmd_run(args: &[String]) {
-    if args.is_empty() {
-        eprintln!("usage: bags run <project> [-- <cmd...>]");
+    let (opts, cmd) = match args.iter().position(|a| a == "--") {
+        Some(p) => (&args[..p], args[p + 1..].to_vec()),
+        None => (args, Vec::new()),
+    };
+    let (net, rest) = parse_net(opts);
+    if rest.is_empty() {
+        eprintln!("usage: bags run [--net pasta|host|none] <project> [-- <cmd...>]");
         exit(2);
     }
-    let project = &args[0];
-    let rest = &args[1..];
-    let cmd: Vec<String> = match rest.iter().position(|a| a == "--") {
-        Some(pos) => rest[pos + 1..].to_vec(),
-        None => rest.to_vec(),
-    };
+    let project = &rest[0];
     let cmd = if cmd.is_empty() {
         vec!["/bin/bash".to_string()]
     } else {
         cmd
     };
-
     let root = ensure_project_root(project);
-    let mut c = Command::new("bwrap");
-    add_container_base(&mut c, &root, project);
-    c.arg("--");
-    c.args(&cmd);
+    let inner: Vec<OsString> = cmd.iter().map(OsString::from).collect();
 
-    eprintln!(
-        "[bags] run project={project} root={} (shared rootfs ro, host net, no supervisor)",
-        root.display()
-    );
+    eprintln!("[bags] run project={project} net={}", net.label());
+    let mut c = assemble(&root, project, net, vec![], inner);
     match c.status() {
         Ok(status) => exit(status.code().unwrap_or(1)),
         Err(e) => {
-            eprintln!("bags: failed to exec bwrap: {e} (is bubblewrap installed?)");
+            eprintln!("bags: failed to launch container: {e}");
             exit(1);
         }
     }
@@ -145,11 +256,11 @@ fn cmd_run(args: &[String]) {
 // bags up — launch a supervised container (host side)
 // ---------------------------------------------------------------------------
 
-static CHILD_PID: AtomicI32 = AtomicI32::new(-1); // bwrap monitor (fallback)
+static CHILD_PID: AtomicI32 = AtomicI32::new(-1); // direct child (pasta or bwrap), fallback
 static INIT_PID: AtomicI32 = AtomicI32::new(-1); // sandbox PID 1, host-visible pid
 
-/// Forward a terminating signal to the sandbox PID 1 *directly* (never to the bwrap
-/// monitor — killing the monitor triggers PR_SET_PDEATHSIG SIGKILL and skips quiesce).
+/// Forward a terminating signal to the sandbox PID 1 directly, so `bags init` runs its
+/// quiesce. Never signal the monitor — that triggers pdeathsig SIGKILL and skips quiesce.
 extern "C" fn forward_term(_sig: libc::c_int) {
     let p = INIT_PID.load(Ordering::SeqCst);
     let target = if p > 0 {
@@ -160,25 +271,6 @@ extern "C" fn forward_term(_sig: libc::c_int) {
     if target > 0 {
         unsafe { libc::kill(target, libc::SIGTERM) };
     }
-}
-
-/// Read bwrap's `--info-fd` JSON and extract the sandbox `child-pid` (host pid of PID 1).
-fn read_child_pid(fd: i32) -> Option<i32> {
-    let mut buf = [0u8; 512];
-    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-    if n <= 0 {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&buf[..n as usize]);
-    let key = "\"child-pid\":";
-    let i = s.find(key)?;
-    s[i + key.len()..]
-        .chars()
-        .skip_while(|c| c.is_whitespace())
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .parse()
-        .ok()
 }
 
 fn install_forwarders() {
@@ -193,12 +285,47 @@ fn install_forwarders() {
     }
 }
 
+/// Find the host-visible pid of a project's `bags init` by matching its cmdline.
+fn find_init_pid(project: &str) -> Option<i32> {
+    let rd = fs::read_dir("/proc").ok()?;
+    for e in rd.flatten() {
+        let pid = match e.file_name().to_string_lossy().parse::<i32>() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let data = match fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let parts: Vec<&[u8]> = data.split(|b| *b == 0).filter(|s| !s.is_empty()).collect();
+        if parts.len() >= 3
+            && parts[0] == b"/run/bags"
+            && parts[1] == b"init"
+            && parts[2] == project.as_bytes()
+        {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+fn poll_init_pid(project: &str, tries: u32) -> Option<i32> {
+    for _ in 0..tries {
+        if let Some(p) = find_init_pid(project) {
+            return Some(p);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
 fn cmd_up(args: &[String]) {
-    if args.is_empty() {
-        eprintln!("usage: bags up <project>");
+    let (net, rest) = parse_net(args);
+    if rest.is_empty() {
+        eprintln!("usage: bags up [--net pasta|host|none] <project>");
         exit(2);
     }
-    let project = &args[0];
+    let project = &rest[0];
     let root = ensure_project_root(project);
     let exe = env::current_exe().unwrap_or_else(|e| {
         eprintln!("bags: cannot find own path: {e}");
@@ -206,44 +333,33 @@ fn cmd_up(args: &[String]) {
     });
     let services_file = project_dir(project).join("services");
 
-    let mut c = Command::new("bwrap");
-    add_container_base(&mut c, &root, project);
-    // Make the bags binary available inside as PID 1's program.
-    c.arg("--ro-bind").arg(&exe).arg("/run/bags");
+    let mut extra: Vec<OsString> = Vec::new();
+    push3(&mut extra, "--ro-bind", exe, "/run/bags");
     if services_file.exists() {
-        c.arg("--ro-bind").arg(&services_file).arg("/run/bags.services");
+        push3(&mut extra, "--ro-bind", services_file, "/run/bags.services");
     }
+    extra.push("--as-pid-1".into());
 
-    // Pipe for bwrap --info-fd: lets us learn the sandbox PID 1's host pid so we can
-    // signal it directly for a graceful quiesce. Write end must be inheritable.
-    let mut fds = [0i32; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        eprintln!("bags: pipe failed");
-        exit(1);
-    }
-    let (info_r, info_w) = (fds[0], fds[1]);
-    unsafe { libc::fcntl(info_r, libc::F_SETFD, libc::FD_CLOEXEC) };
+    let inner: Vec<OsString> = ["/run/bags", "init", project]
+        .iter()
+        .map(OsString::from)
+        .collect();
 
-    c.arg("--info-fd").arg(info_w.to_string());
-    c.arg("--as-pid-1");
-    c.arg("--").arg("/run/bags").arg("init").arg(project);
-
+    let mut c = assemble(&root, project, net, extra, inner);
     install_forwarders();
-    eprintln!("[bags] up project={project} (PID-1 supervisor)");
+    eprintln!("[bags] up project={project} net={} (PID-1 supervisor)", net.label());
     let mut child = match c.spawn() {
         Ok(ch) => ch,
         Err(e) => {
-            eprintln!("bags: failed to exec bwrap: {e} (is bubblewrap installed?)");
+            eprintln!("bags: failed to launch container: {e}");
             exit(1);
         }
     };
     CHILD_PID.store(child.id() as i32, Ordering::SeqCst);
-    unsafe { libc::close(info_w) }; // parent keeps only the read end
-    if let Some(p) = read_child_pid(info_r) {
-        INIT_PID.store(p, Ordering::SeqCst);
+    match poll_init_pid(project, 100) {
+        Some(p) => INIT_PID.store(p, Ordering::SeqCst),
+        None => eprintln!("[bags] warning: could not locate init pid; shutdown may be abrupt"),
     }
-    unsafe { libc::close(info_r) };
-
     let status = child.wait().unwrap_or_else(|e| {
         eprintln!("bags: wait failed: {e}");
         exit(1);
@@ -340,8 +456,6 @@ fn split_first(s: &str) -> (&str, &str) {
     }
 }
 
-/// Block TERM/INT/CHLD and route them through a signalfd so the supervise loop
-/// can't miss a SIGCHLD between reaping and waiting.
 fn setup_signalfd() -> i32 {
     unsafe {
         let mut mask: libc::sigset_t = std::mem::zeroed();
@@ -370,8 +484,6 @@ fn next_signal(sfd: i32) -> Option<i32> {
     }
 }
 
-/// Spawn a shell command with a clean (unblocked) signal mask — children must
-/// not inherit PID 1's blocked signals, or they'd ignore SIGTERM on quiesce.
 fn spawn_shell(cmd: &str) -> std::io::Result<u32> {
     let mut c = Command::new("/bin/sh");
     c.arg("-c").arg(cmd);
@@ -412,8 +524,6 @@ fn describe_status(status: i32) -> String {
     }
 }
 
-/// The clean quiesce specified in DESIGN.md: stop hooks, warn on undeclared,
-/// SIGTERM the tree, wait, then SIGKILL stragglers.
 fn quiesce(services: &[Service], running: &HashMap<i32, String>) {
     eprintln!("[bags init] quiescing");
     for s in services {
@@ -523,13 +633,17 @@ USAGE:
     bags <command> [args]
 
 COMMANDS:
-    run <project> [-- <cmd>]   run a command in a project's namespace          [implemented]
-    up <project>               launch a PID-1 supervised container             [implemented]
-    ps                         list running projects and services              [planned]
-    move <project> <host>      migrate a session to another host               [planned]
-    attach <project>           attach a roaming client                         [planned]
-    preflight <project>        report the cost/loss of a move                   [planned]
+    run [--net M] <project> [-- <cmd>]   run a command in a project's namespace   [implemented]
+    up  [--net M] <project>              launch a PID-1 supervised container       [implemented]
+    ps                                   list running projects and services        [planned]
+    move <project> <host>                migrate a session to another host         [planned]
+    attach <project>                     attach a roaming client                   [planned]
+    preflight <project>                  report the cost/loss of a move            [planned]
     help | version
+
+    --net pasta  (default) dedicated netns, own loopback, NAT egress via pasta
+    --net host   share the host network namespace
+    --net none   isolated netns, loopback only, no egress
 
 Services are declared in ~/.bags/<project>/services, one directive per line:
     start <name> <shell command>

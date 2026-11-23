@@ -20,9 +20,15 @@ use std::process::Command;
 /// supervisor binary — not under it, since that path is a file.)
 pub(crate) const AGENT_SOCK: &str = "/run/tup-agent.sock";
 
-/// Where a `gate`'s socket appears inside the container (a sibling of the `/run/tup` binary).
-/// The container holds only this socket; the host-side gatekeeper performs the filtered op.
-pub(crate) const GATE_SOCK: &str = "/run/tup-gate.sock";
+/// Where the project's gate sockets appear inside the container: a directory with one
+/// `<name>.sock` per declared gate (a sibling of the `/run/tup` binary). The host binds this
+/// whole dir; the container holds only the sockets, and the host-side gatekeepers perform the
+/// filtered ops.
+pub(crate) const GATE_DIR: &str = "/run/tup-gates";
+
+/// The built-in git gate's socket inside the container — `<GATE_DIR>/git.sock`. Kept as a named
+/// constant for back-compat (`tup push`/`tup fetch` and the legacy `TUP_GATE_SOCK` override).
+pub(crate) const GATE_SOCK: &str = "/run/tup-gates/git.sock";
 
 /// A caller-supplied bind (the project tree, ~/.claude, the exe at /run/tup, …).
 pub(crate) struct Bind {

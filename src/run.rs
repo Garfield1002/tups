@@ -3,7 +3,7 @@
 use crate::net::{net_from_str, port_from_str, Net, PortForward};
 use crate::nixenv::{self, env_mode_from_str, EnvMode};
 use crate::project::ensure_project_root;
-use crate::sandbox::{launch, map_from_str, Bind, Spec, AGENT_SOCK, GATE_SOCK};
+use crate::sandbox::{launch, map_from_str, Bind, Spec, AGENT_SOCK, GATE_DIR};
 use crate::{agent, agent::Agent, gate, gate::Gate};
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -116,7 +116,7 @@ pub(crate) fn cmd_run(args: &[String]) {
     let chdir = chdir.unwrap_or_else(|| "/work".to_string());
     let mut forward_agent = false;
     let mut agent_handle: Option<Agent> = None;
-    let mut gate_handle: Option<Gate> = None;
+    let mut gate_handles: Vec<Gate> = Vec::new();
     // Hermetic Nix env: realise the project's flake to a profile store path first (host side,
     // where nix + network + the store live).
     let profile: Option<PathBuf> = match env {
@@ -151,19 +151,26 @@ pub(crate) fn cmd_run(args: &[String]) {
                     Err(e) => eprintln!("[tup] warning: ssh agent '{name}' not forwarded: {e}"),
                 }
             }
-            // Gate (outputs.tup.gates.git): start the host gatekeeper, forward only its socket.
-            if let Some(policy) = nixenv::read_gate(&project) {
-                match gate::spawn(policy, &project, root.clone()) {
+            // Gates (outputs.tup.gates): start each declared host gatekeeper (git built-in +
+            // user-defined command gates), then forward the whole gate dir (one <name>.sock each).
+            let gates = nixenv::read_gates(&project);
+            let mut started_any_gate = false;
+            for spec in gates {
+                let name = spec.name.clone();
+                match gate::spawn(spec, &project, root.clone()) {
                     Ok(g) => {
-                        extra.push(Bind {
-                            src: g.sock.clone(),
-                            dst: PathBuf::from(GATE_SOCK),
-                            ro: false,
-                        });
-                        gate_handle = Some(g);
+                        gate_handles.push(g);
+                        started_any_gate = true;
                     }
-                    Err(e) => eprintln!("[tup] warning: git gate not started: {e}"),
+                    Err(e) => eprintln!("[tup] warning: gate '{name}' not started: {e}"),
                 }
+            }
+            if started_any_gate {
+                extra.push(Bind {
+                    src: gate::gates_dir(&project),
+                    dst: PathBuf::from(GATE_DIR),
+                    ro: false,
+                });
             }
             Some(p)
         }
@@ -212,7 +219,7 @@ pub(crate) fn cmd_run(args: &[String]) {
     if let Some(a) = &agent_handle {
         a.stop();
     }
-    if let Some(g) = &gate_handle {
+    for g in &gate_handles {
         g.stop();
     }
     match result {

@@ -224,6 +224,13 @@ pub(crate) fn cmd_up(args: &[String]) {
         Ok(ch) => ch,
         Err(e) => {
             eprintln!("tup: failed to launch container: {e}");
+            // Tear down the host helpers we already started, or they orphan on every failed up.
+            if let Some(a) = &agent_handle {
+                a.stop();
+            }
+            if let Some(g) = &gate_handle {
+                g.stop();
+            }
             exit(1);
         }
     };
@@ -249,6 +256,12 @@ pub(crate) fn cmd_up(args: &[String]) {
     }
     let status = child.wait().unwrap_or_else(|e| {
         eprintln!("tup: wait failed: {e}");
+        if let Some(a) = &agent_handle {
+            a.stop();
+        }
+        if let Some(g) = &gate_handle {
+            g.stop();
+        }
         exit(1);
     });
     // Reap the forwarded agent / gatekeeper now the supervised container has exited.
@@ -258,5 +271,6 @@ pub(crate) fn cmd_up(args: &[String]) {
     if let Some(g) = &gate_handle {
         g.stop();
     }
-    exit(status.code().unwrap_or(0));
+    // A child killed by a signal has no exit code; report non-zero, not a false success.
+    exit(status.code().unwrap_or(1));
 }

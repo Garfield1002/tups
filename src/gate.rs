@@ -49,9 +49,24 @@ pub(crate) fn authorize(policy: &GatePolicy, op: &str, args: &[String]) -> Resul
             return Err(format!("argument '{a}' looks like an option; refused"));
         }
     }
-    if op == "push" && !policy.refs.is_empty() {
+    // Destructive push forms are refused regardless of the ref allowlist: a leading '+' is a
+    // force-push (history rewrite) and a leading ':' deletes a ref. Neither starts with '-', so
+    // the option check above misses them, and with an empty `refs` nothing else would catch them.
+    if op == "push" {
+        for a in args {
+            if let Some(rest) = a.strip_prefix('+') {
+                return Err(format!("force-push refspec '+{rest}' is refused"));
+            }
+            if a.starts_with(':') {
+                return Err(format!("ref-deletion refspec '{a}' is refused"));
+            }
+        }
+    }
+    // A declared ref allowlist applies to push AND fetch: a fetch refspec writes local refs in
+    // the shared working tree, so it is a host action too, not container-only.
+    if (op == "push" || op == "fetch") && !policy.refs.is_empty() {
         if args.is_empty() {
-            return Err("this gate requires an explicit ref to push".to_string());
+            return Err(format!("this gate requires an explicit ref to {op}"));
         }
         for a in args {
             if !policy.refs.iter().any(|r| r == a) {
@@ -116,6 +131,9 @@ fn serve_on(sock: PathBuf, policy: GatePolicy, tree: PathBuf) -> std::io::Result
 
 /// Serve one request: read a line, filter it, and (if allowed) run git on the host.
 fn handle_conn(mut stream: UnixStream, policy: &GatePolicy, tree: &PathBuf) {
+    // Bound the read: a container that connects and never closes its write half must not wedge
+    // the (single-threaded) accept loop indefinitely.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let mut req = String::new();
     if stream.read_to_string(&mut req).is_err() {
         return;
@@ -129,13 +147,30 @@ fn handle_conn(mut stream: UnixStream, policy: &GatePolicy, tree: &PathBuf) {
         return;
     }
     // The remote comes from POLICY, never the request. The op/args were authorized above.
-    let out = Command::new("git")
+    //
+    // CRITICAL: `tree` is the working tree bound READ-WRITE into the container, so the container
+    // controls `<tree>/.git`. Host-side git must therefore honor none of the repo-local code
+    // vectors a hostile hook/repo could plant: hooks (e.g. pre-push), fsmonitor, core.sshCommand,
+    // and the ext:: transport (reachable via url.insteadOf). `-c` on the command line beats
+    // repo-local config, and GIT_SSH_COMMAND beats a repo-local core.sshCommand. (Residual: a
+    // url.insteadOf can still redirect to a different ssh host — it can't run host code, but it
+    // can misdirect the push; a clean mirror would close that too.)
+    let mut cmd = Command::new("git");
+    cmd.arg("-c")
+        .arg("core.hooksPath=/dev/null")
+        .arg("-c")
+        .arg("core.fsmonitor=")
+        .arg("-c")
+        .arg("protocol.ext.allow=never")
         .arg("-C")
         .arg(tree)
         .arg(&op)
         .arg(&policy.remote)
-        .args(&args)
-        .output();
+        .args(&args);
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+        cmd.env("GIT_SSH_COMMAND", "ssh");
+    }
+    let out = cmd.output();
     match out {
         Ok(o) => {
             let code = o.status.code().unwrap_or(-1);
@@ -396,6 +431,62 @@ mod tests {
         assert!(inj.starts_with("DENIED "), "option injection must be refused: {inj:?}");
 
         gate.stop();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn refuses_force_push_and_delete() {
+        let p = policy(&["push"], &[]); // empty refs == "any ref"
+        assert!(authorize(&p, "push", &args(&["+refs/heads/main"])).is_err());
+        assert!(authorize(&p, "push", &args(&["+main:main"])).is_err());
+        assert!(authorize(&p, "push", &args(&[":refs/heads/main"])).is_err());
+        assert!(authorize(&p, "push", &args(&["main"])).is_ok());
+    }
+
+    #[test]
+    fn ref_allowlist_also_covers_fetch() {
+        let p = policy(&["fetch"], &["main"]);
+        assert!(authorize(&p, "fetch", &args(&["main"])).is_ok());
+        assert!(authorize(&p, "fetch", &args(&["refs/heads/secret:refs/heads/x"])).is_err());
+    }
+
+    #[test]
+    fn gatekeeper_does_not_run_repo_hooks_on_the_host() {
+        // A container-planted .git/hooks/pre-push must NOT execute when the host runs the
+        // sanctioned push (regression for the gate->host-RCE fix).
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!("tup-gate-hook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let bare = tmp.join("remote.git");
+        let tree = tmp.join("work");
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::create_dir_all(&tree).unwrap();
+        Command::new("git").args(["init", "--bare", "-q", "-b", "main"]).arg(&bare).status().unwrap();
+        git(&tree, &["init", "-q", "-b", "main"]);
+        git(&tree, &["config", "user.email", "t@t"]);
+        git(&tree, &["config", "user.name", "t"]);
+        std::fs::write(tree.join("f"), "x").unwrap();
+        git(&tree, &["add", "."]);
+        git(&tree, &["commit", "-qm", "init"]);
+
+        let sentinel = tmp.join("pwned");
+        let hook = tree.join(".git/hooks/pre-push");
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", sentinel.display())).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let policy = GatePolicy {
+            remote: bare.to_string_lossy().into_owned(),
+            allow: vec!["push".to_string()],
+            refs: vec![],
+        };
+        let sock = tmp.join("gate.sock");
+        let gate = serve_on(sock.clone(), policy, tree.clone()).unwrap();
+        thread::sleep(Duration::from_millis(150));
+        let resp = send(&sock, "push HEAD:refs/heads/main");
+        gate.stop();
+
+        assert!(resp.starts_with("OK 0"), "push should still succeed: {resp:?}");
+        assert!(!sentinel.exists(), "repo pre-push hook must NOT execute on the host");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

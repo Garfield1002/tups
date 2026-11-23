@@ -31,6 +31,7 @@ pub(crate) fn cmd_init(args: &[String]) {
         }
     }
     let self_pid = unsafe { libc::getpid() };
+    let had_services = !running.is_empty();
     eprintln!(
         "[tup init] project={project} pid={self_pid} supervising {} service(s)",
         running.len()
@@ -38,7 +39,18 @@ pub(crate) fn cmd_init(args: &[String]) {
 
     loop {
         match next_signal(sfd) {
-            Some(libc::SIGCHLD) => reap(&mut running),
+            Some(libc::SIGCHLD) => {
+                reap(&mut running);
+                // If every declared service has exited, the container's purpose is done — quit
+                // rather than lingering as a hollow namespace that blocks `tup up` indefinitely.
+                // (A project with zero declared services is a deliberate namespace holder for
+                // `tup attach`, so it stays up.)
+                if had_services && running.is_empty() {
+                    eprintln!("[tup init] all declared services have exited; shutting down");
+                    quiesce(&services, &running);
+                    exit(0);
+                }
+            }
             Some(libc::SIGTERM) | Some(libc::SIGINT) => {
                 quiesce(&services, &running);
                 exit(0);
@@ -196,7 +208,14 @@ fn quiesce(services: &[Service], running: &HashMap<i32, String>) {
         std::thread::sleep(Duration::from_millis(100));
     }
     unsafe { libc::kill(-1, libc::SIGKILL) };
-    reap(&mut discard);
+    // SIGKILL is async: reap in a short loop so "stopped cleanly" doesn't precede actual reaping.
+    for _ in 0..10 {
+        reap(&mut discard);
+        if only_init_left() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     eprintln!("[tup init] stopped cleanly");
 }
 

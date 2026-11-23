@@ -97,6 +97,8 @@ fn start(keypath: &PathBuf, project: &str) -> io::Result<Agent> {
 
     // Load the (only) key into this agent.
     let st = Command::new("ssh-add")
+        .arg("-t")
+        .arg("1800") // bound the signing window to 30 min; the agent is also killed on teardown
         .arg(keypath)
         .env("SSH_AUTH_SOCK", &agent.sock)
         .status()

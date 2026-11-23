@@ -100,7 +100,12 @@ fn preflight_report(project: &str) {
             eprintln!("              {} {}", if b.ro { "ro" } else { "rw" }, b.src.display());
         }
     }
-    eprintln!("  note      : undeclared processes are reported by the source's quiesce");
+    eprintln!(
+        "  undeclared: enumerated at quiesce — stop hooks run, then survivors get SIGTERM then SIGKILL"
+    );
+    eprintln!(
+        "  caches    : reachability from the target is not checked here; a cold cache makes resume honest-but-slow"
+    );
 }
 
 pub(crate) fn cmd_preflight(args: &[String]) {
@@ -238,12 +243,21 @@ fn nix_copy(dest: &str, profile: &Path) {
 }
 
 pub(crate) fn cmd_move(args: &[String]) {
-    if args.len() < 2 {
-        eprintln!("usage: tup move <project> <local:<newproject> | [user@]host>");
+    let mut force = false;
+    let mut pos: Vec<&String> = Vec::new();
+    for a in args {
+        if a == "--force" {
+            force = true;
+        } else {
+            pos.push(a);
+        }
+    }
+    if pos.len() < 2 {
+        eprintln!("usage: tup move [--force] <project> <local:<newproject> | [user@]host>");
         exit(2);
     }
-    let project = &args[0];
-    let dest = &args[1];
+    let project = pos[0].as_str();
+    let dest = pos[1].as_str();
     // Validate BOTH the project name and the destination up front — before preflight or the
     // quiesce below touches anything — so a bad value can't kill the source and then abort, and
     // can never reach a path or a shell/ssh argument. (local_move/remote_move re-check, so they
@@ -256,25 +270,30 @@ pub(crate) fn cmd_move(args: &[String]) {
 
     preflight_report(project);
 
-    // Quiesce the source at the (simulated) turn boundary: signal PID 1 directly and wait
-    // for the container to tear down, so stop hooks flush state into the root.
+    // Quiesce the source at the (simulated) turn boundary: signal PID 1 directly and wait for
+    // the container to tear down, so stop hooks flush state into the root. If it won't stop in
+    // time, SIGKILL it so we ship a STATIC tree rather than one being written mid-flush.
     if let Some(pid) = find_init_pid(project) {
-        eprintln!("[tup] quiescing source (init pid {pid})");
+        eprintln!(
+            "[tup] quiescing source (init pid {pid}); if the move fails it stays stopped — restart with `tup up {project}`"
+        );
         unsafe { libc::kill(pid, libc::SIGTERM) };
         if !wait_for_gone(pid, 10_000) {
-            eprintln!("[tup] warning: source still running after 10s; shipping anyway");
+            eprintln!("[tup] source still running after 10s; SIGKILL so we ship a static tree");
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = wait_for_gone(pid, 3_000);
         }
     } else {
         eprintln!("[tup] source not running; shipping current on-disk state");
     }
 
     match dest.strip_prefix("local:") {
-        Some(newproj) => local_move(project, newproj),
-        None => remote_move(project, dest),
+        Some(newproj) => local_move(project, newproj, force),
+        None => remote_move(project, dest, force),
     }
 }
 
-fn local_move(project: &str, newproj: &str) {
+fn local_move(project: &str, newproj: &str, force: bool) {
     // Same guard as every other verb: `local:..` must not resolve project_dir to ~ and then be
     // rsync --delete'd, and a leading-dash name must not reach the spawned `tup up` as a flag.
     crate::project::ensure_valid_name(newproj);
@@ -290,6 +309,14 @@ fn local_move(project: &str, newproj: &str) {
     }
     let src_dir = project_dir(project);
     let dst_dir = project_dir(newproj);
+    // Refuse to clobber an existing (stopped) destination project: the `rsync --delete` below
+    // would wipe its working tree + persist. `--force` opts in.
+    if !force && dst_dir.join("root").exists() {
+        eprintln!(
+            "tup: destination project '{newproj}' already exists — refusing to overwrite its working tree/persist (pass --force to replace)"
+        );
+        exit(1);
+    }
     let dst_root = dst_dir.join("root");
     let _ = fs::create_dir_all(&dst_root);
 
@@ -354,7 +381,7 @@ fn remote_running(dest: &str, project: &str) -> Option<bool> {
     }
 }
 
-fn remote_move(project: &str, dest: &str) {
+fn remote_move(project: &str, dest: &str, force: bool) {
     validate_dest(dest);
     // Ship to ~/.tup/<project> on the remote (rsync remote paths are relative to $HOME),
     // then start it there detached. Assumes `tup` is on PATH on the remote.
@@ -370,6 +397,13 @@ fn remote_move(project: &str, dest: &str) {
             exit(1);
         }
         Some(false) => {}
+    }
+    // Refuse to clobber an existing (stopped) project on the target unless --force.
+    if !force && remote_exists(dest, &format!(".tup/{project}/root")) {
+        eprintln!(
+            "tup: destination '{dest}' already has project '{project}' — refusing to overwrite (pass --force to replace)"
+        );
+        exit(1);
     }
     let src_dir = project_dir(project);
     let s = format!("{}/", src_dir.join("root").display());
@@ -418,8 +452,13 @@ fn remote_move(project: &str, dest: &str) {
     let up = format!(
         "setsid nohup tup up {envflag}--net {net} {project} > .tup/{project}/up.log 2>&1 < /dev/null &"
     );
-    ssh(dest, &up);
-    eprintln!("[tup] requested start on {dest}; confirm with: ssh {dest} tup preflight {project}");
+    if ssh(dest, &up) {
+        eprintln!("[tup] requested start on {dest}; confirm with: ssh {dest} tup preflight {project}");
+    } else {
+        eprintln!(
+            "[tup] payload shipped to {dest} but the start command failed; start it by hand: ssh {dest} tup up {envflag}--net {net} {project}"
+        );
+    }
 }
 
 /// Validate an ssh destination before it reaches ssh/rsync as a positional argument. The
@@ -444,12 +483,32 @@ fn validate_dest(dest: &str) {
     }
 }
 
-fn ssh(dest: &str, cmd: &str) {
+fn ssh(dest: &str, cmd: &str) -> bool {
     match Command::new("ssh").arg(dest).arg(cmd).status() {
-        Ok(s) if s.success() => {}
-        Ok(s) => eprintln!("[tup] ssh {dest} failed ({s}): {cmd}"),
-        Err(e) => eprintln!("[tup] ssh error: {e}"),
+        Ok(s) if s.success() => true,
+        Ok(s) => {
+            eprintln!("[tup] ssh {dest} failed ({s}): {cmd}");
+            false
+        }
+        Err(e) => {
+            eprintln!("[tup] ssh error: {e}");
+            false
+        }
     }
+}
+
+/// Does `path` (relative to the remote home) exist on `dest`? Only `true` when the check ran and
+/// the path is there — an absent path (`test` exits 1) or an ssh error maps to `false`, without
+/// the failure log that `ssh()` would print for a normal "absent" result.
+fn remote_exists(dest: &str, path: &str) -> bool {
+    matches!(
+        Command::new("ssh")
+            .arg(dest)
+            .arg(format!("test -e {path}"))
+            .status()
+            .map(|s| s.code()),
+        Ok(Some(0))
+    )
 }
 
 #[cfg(test)]

@@ -314,6 +314,13 @@ pub(crate) fn read_tup_config(project: &str) -> TupConfig {
         binds: Vec::new(),
         ssh_agent_key: None,
     };
+    // A project with no flake is host-mode (the default). There is nothing to apply, and the
+    // nix probe below would fail for a reason OTHER than "no tup output" (no flake at all / nix
+    // absent) and wrongly `exit(1)` — breaking `tup preflight`/`tup move` for every host project.
+    // Return empty before touching nix.
+    if !is_nix_project(project) {
+        return empty;
+    }
     // Probe whether the flake has a `tup` output at all. Distinguish two failures that used to
     // collapse together: a flake that simply has no `tup` output (normal — e.g. host-authored)
     // returns empty silently; but a `tup` output that exists and *throws* (or nix erroring for
@@ -369,6 +376,8 @@ pub(crate) fn read_tup_config(project: &str) -> TupConfig {
                         dst: PathBuf::from(p[2]),
                         ro: p[0] == "ro",
                     });
+                } else {
+                    eprintln!("[tup] warning: dropping malformed tup.binds entry (expected 'ro|rw<TAB>host<TAB>path'): {line:?}");
                 }
             }
             v

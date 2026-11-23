@@ -53,7 +53,13 @@ pub(crate) fn cmd_ps(_args: &[String]) {
             }
             let name = e.file_name().to_string_lossy().into_owned();
             let pid = find_init_pid(&name);
-            let net = read_net_label(&name);
+            // Only show a net mode the project actually recorded (via `tup up`); a never-upped
+            // project has no `net` file, so show "-" rather than the misleading pasta default.
+            let net = if project_dir(&name).join("net").exists() {
+                read_net_label(&name)
+            } else {
+                "-".to_string()
+            };
             let nix = nixenv::is_nix_project(&name);
             let svcs = service_count(&name);
             rows.push((name, pid, net, nix, svcs));
@@ -129,9 +135,17 @@ pub(crate) fn cmd_attach(args: &[String]) {
         "--uts",
         "--ipc",
         "--pid",
-        "--net",
-        "--wdns=/work",
     ]);
+    // Networking: a pasta container's netns is owned by pasta's *outer* userns, which we don't
+    // hold caps in once we've entered the container's inner userns — so setns into it would
+    // EPERM. Skip it and let the shell share the host network (cooperative model), with a note.
+    // For host/none the netns is reachable, so enter it.
+    if read_net_label(&project) == "pasta" {
+        eprintln!("[tup] note: pasta netns isn't enterable from the container userns; the attached shell uses the host network");
+    } else {
+        c.arg("--net");
+    }
+    c.arg("--wdns=/work");
     c.arg("--")
         .arg("/usr/bin/env")
         .arg("-i")

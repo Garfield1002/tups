@@ -290,36 +290,65 @@ pub(crate) struct TupConfig {
 /// missing or malformed `tup` output yields an empty config rather than an error.
 pub(crate) fn read_tup_config(project: &str) -> TupConfig {
     let flakeref = env_dir(project).display().to_string();
-    let net = nix_eval_tup(&flakeref, r#"c: c.net or """#).and_then(|s| match s.trim() {
-        "pasta" => Some(Net::Pasta),
-        "host" => Some(Net::Host),
-        "none" => Some(Net::None),
-        _ => None,
-    });
-    // Persist volumes: one container path per line.
-    let persist = nix_eval_tup(&flakeref, r#"c: builtins.concatStringsSep "\n" (c.persist or [])"#)
-        .map(|s| {
-            s.lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(PathBuf::from)
-                .collect()
-        })
-        .unwrap_or_default();
-    // One tab-separated line per bind: "<ro|rw>\t<host>\t<path>".
-    let apply = r#"c: builtins.concatStringsSep "\n" (map (b: "${if (b.ro or true) then "ro" else "rw"}\t${b.host}\t${b.path}") (c.binds or []))"#;
-    let mut binds = Vec::new();
-    if let Some(out) = nix_eval_tup(&flakeref, apply) {
-        for line in out.lines().filter(|l| !l.trim().is_empty()) {
-            let p: Vec<&str> = line.splitn(3, '\t').collect();
-            if p.len() == 3 {
-                binds.push(Bind {
-                    src: PathBuf::from(p[1]),
-                    dst: PathBuf::from(p[2]),
-                    ro: p[0] == "ro",
-                });
-            }
-        }
+    let empty = TupConfig {
+        net: None,
+        persist: Vec::new(),
+        binds: Vec::new(),
+    };
+    // Probe whether the flake has a `tup` output at all. If not, that's normal (e.g. a
+    // host-authored flake) — return empty silently. If it does, a per-field failure below is a
+    // real mistake in the user's `tup` data, so we surface it rather than dropping data quietly.
+    if nix_eval_tup(&flakeref, r#"c: """#).is_err() {
+        return empty;
     }
+    // `net`/`persist` use `or` defaults, so they only fail on a genuinely broken value.
+    let net = nix_eval_tup(&flakeref, r#"c: c.net or """#)
+        .ok()
+        .and_then(|s| match s.trim() {
+            "pasta" => Some(Net::Pasta),
+            "host" => Some(Net::Host),
+            "none" => Some(Net::None),
+            _ => None,
+        });
+    // Persist volumes: one container path per line.
+    let persist = match nix_eval_tup(
+        &flakeref,
+        r#"c: builtins.concatStringsSep "\n" (c.persist or [])"#,
+    ) {
+        Ok(s) => s
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(PathBuf::from)
+            .collect(),
+        Err(e) => {
+            warn_tup("persist", &e);
+            Vec::new()
+        }
+    };
+    // One tab-separated line per bind: "<ro|rw>\t<host>\t<path>". A single malformed entry
+    // (missing host/path) throws here; we warn and skip the whole set rather than silently
+    // leaving the container without binds it was told to have.
+    let apply = r#"c: builtins.concatStringsSep "\n" (map (b: "${if (b.ro or true) then "ro" else "rw"}\t${b.host}\t${b.path}") (c.binds or []))"#;
+    let binds = match nix_eval_tup(&flakeref, apply) {
+        Ok(out) => {
+            let mut v = Vec::new();
+            for line in out.lines().filter(|l| !l.trim().is_empty()) {
+                let p: Vec<&str> = line.splitn(3, '\t').collect();
+                if p.len() == 3 {
+                    v.push(Bind {
+                        src: PathBuf::from(p[1]),
+                        dst: PathBuf::from(p[2]),
+                        ro: p[0] == "ro",
+                    });
+                }
+            }
+            v
+        }
+        Err(e) => {
+            warn_tup("binds", &e);
+            Vec::new()
+        }
+    };
     TupConfig {
         net,
         persist,
@@ -327,7 +356,9 @@ pub(crate) fn read_tup_config(project: &str) -> TupConfig {
     }
 }
 
-fn nix_eval_tup(flakeref: &str, apply: &str) -> Option<String> {
+/// Evaluate `apply` against the flake's `tup` output. `Ok` on success, `Err(stderr)` when the
+/// eval fails (a missing `tup` output, or a mistake in the user's `tup` data).
+fn nix_eval_tup(flakeref: &str, apply: &str) -> Result<String, String> {
     let out = Command::new("nix")
         .args([
             "eval",
@@ -339,12 +370,27 @@ fn nix_eval_tup(flakeref: &str, apply: &str) -> Option<String> {
         .arg("--apply")
         .arg(apply)
         .output()
-        .ok()?;
+        .map_err(|e| e.to_string())?;
     if out.status.success() {
-        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
-        None
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
     }
+}
+
+/// Warn that one `outputs.tup` field was ignored because its eval threw — surfacing the nix
+/// error's key line so a typo in the user's `tup` data isn't swallowed silently.
+fn warn_tup(attr: &str, err: &str) {
+    // nix prints a cascade of `error:` lines; the last one with text after the colon is the
+    // concrete cause (e.g. "attribute 'path' missing").
+    let msg = err
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("error:"))
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .last()
+        .unwrap_or("eval failed (see nix output)");
+    eprintln!("[tup] warning: ignoring outputs.tup.{attr} — {msg}");
 }
 
 // ---------------------------------------------------------------------------
@@ -357,19 +403,24 @@ pub(crate) fn persist_dir(project: &str) -> PathBuf {
     project_dir(project).join("persist")
 }
 
-/// Map a container persist path to a filesystem-safe backing slug (`/var/lib/x` -> `var_lib_x`).
+/// Map a container persist path to a filesystem-safe backing slug (`/var/lib/x` ->
+/// `var_lib_x-<hash>`). The hash of the *full* path keeps distinct paths that sanitise alike
+/// (`/a/b` vs `/a_b`) in separate backing dirs; FNV-1a is used (not `DefaultHasher`) so the
+/// slug is stable across tup versions — a move must map a volume to the same dir on the target.
 fn persist_slug(p: &Path) -> String {
-    let s: String = p
-        .to_string_lossy()
+    let full = p.to_string_lossy();
+    let sanitized: String = full
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    let t = s.trim_matches('_').to_string();
-    if t.is_empty() {
-        "root".to_string()
-    } else {
-        t
+    let base = sanitized.trim_matches('_');
+    let base = if base.is_empty() { "root" } else { base };
+    let mut h: u32 = 0x811c_9dc5;
+    for b in full.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
     }
+    format!("{base}-{h:08x}")
 }
 
 /// Back each declared persist volume with a host dir under `persist/` and bind it rw at its

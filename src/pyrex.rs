@@ -269,9 +269,19 @@ fn setup_mounts(ops: &[Op], newroot: &Path) -> io::Result<()> {
     make_private()?;
     tmpfs(newroot)?; // overlay a fresh tmpfs on the (parent-created) new-root dir
 
-    for op in ops {
+    for (i, op) in ops.iter().enumerate() {
         match op {
             Op::Bind { src, dst, ro } => {
+                // Skip a bind a *later* bind will cover: the later one is recursive (MS_BIND |
+                // MS_REC), so it mounts over the whole subtree and shadows this one, which then
+                // lingers in mountinfo as a submount the recursive-ro pass can no longer address
+                // (it remounts a path that now resolves into the later mount, not a mountpoint →
+                // EINVAL). bwrap has no such trouble — the last bind simply wins — so we match it
+                // by not applying a bind the later one makes invisible. (A real case: a wrapper
+                // binds `…/share/claude/versions` ro, then its parent `…/share/claude` ro.)
+                if bind_shadowed(ops, i) {
+                    continue;
+                }
                 let target = under(newroot, dst);
                 prepare_target(&target, src)?;
                 bind(src, &target, *ro).map_err(|e| annotate(e, dst))?;
@@ -324,6 +334,13 @@ fn prepare_target(target: &Path, src: &Path) -> io::Result<()> {
     if src.is_dir() {
         fs::create_dir_all(target)?;
     } else {
+        // If the mountpoint already exists — e.g. it lands on an earlier read-only bind, as the
+        // pasta resolv.conf does when /etc/resolv.conf is a plain file under the ro /etc bind —
+        // do NOT re-create it: File::create opens O_WRONLY|O_TRUNC and fails EROFS, aborting the
+        // whole launch. An existing node is a usable bind target as-is.
+        if target.symlink_metadata().is_ok() {
+            return Ok(());
+        }
         if let Some(p) = target.parent() {
             fs::create_dir_all(p)?;
         }
@@ -538,6 +555,20 @@ fn under(root: &Path, dst: &Path) -> PathBuf {
     root.join(dst.strip_prefix("/").unwrap_or(dst))
 }
 
+/// Is the bind at `ops[i]` shadowed by a later bind? True when some bind after it targets an
+/// ancestor-or-equal mountpoint (`dst.starts_with(later)`): that later recursive bind mounts
+/// over this one, so applying this one is both wasted and the cause of a dangling submount the
+/// recursive-ro pass then trips over. Non-bind ops, and binds nothing later covers, are kept.
+fn bind_shadowed(ops: &[Op], i: usize) -> bool {
+    let dst = match &ops[i] {
+        Op::Bind { dst, .. } => dst,
+        _ => return false,
+    };
+    ops[i + 1..]
+        .iter()
+        .any(|o| matches!(o, Op::Bind { dst: later, .. } if dst.starts_with(later)))
+}
+
 fn annotate(e: io::Error, dst: &Path) -> io::Error {
     io::Error::new(e.kind(), format!("{}: {e}", dst.display()))
 }
@@ -659,4 +690,69 @@ fn parse(args: &[OsString]) -> Spec {
 fn req<'a>(args: &'a [OsString], i: usize, what: &str) -> &'a OsString {
     args.get(i)
         .unwrap_or_else(|| die(&format!("__sandbox: missing value for {what}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bind(dst: &str) -> Op {
+        Op::Bind {
+            src: PathBuf::from(dst),
+            dst: PathBuf::from(dst),
+            ro: true,
+        }
+    }
+
+    #[test]
+    fn bind_shadowed_drops_the_earlier_nested_bind() {
+        // The failing case: a child mount, then its parent bound over it (wrapper order).
+        let ops = vec![
+            bind("/home/u/.local/share/claude/versions"),
+            bind("/home/u/.local/share/claude"),
+        ];
+        assert!(bind_shadowed(&ops, 0)); // versions is covered by the later parent
+        assert!(!bind_shadowed(&ops, 1)); // the parent itself survives
+    }
+
+    #[test]
+    fn bind_shadowed_keeps_parent_then_child_order() {
+        // The good order (ancestor first, refinement after, e.g. /etc then /etc/resolv.conf) must
+        // never be dropped — the later child legitimately refines the earlier parent.
+        let ops = vec![bind("/etc"), bind("/etc/resolv.conf")];
+        assert!(!bind_shadowed(&ops, 0));
+        assert!(!bind_shadowed(&ops, 1));
+    }
+
+    #[test]
+    fn bind_shadowed_ignores_siblings_and_non_binds() {
+        let ops = vec![
+            bind("/work"),
+            Op::Proc(PathBuf::from("/proc")),
+            bind("/nix"),
+        ];
+        assert!(!bind_shadowed(&ops, 0)); // /work not covered by /nix
+        assert!(!bind_shadowed(&ops, 1)); // a Proc op is never "shadowed"
+        assert!(!bind_shadowed(&ops, 2));
+    }
+
+    #[test]
+    fn prepare_target_keeps_an_existing_file_mountpoint() {
+        // Regression: a bind target that already exists (e.g. on an earlier ro mount) must be
+        // left intact — re-creating it with File::create(O_WRONLY|O_TRUNC) would EROFS-abort.
+        let dir = std::env::temp_dir().join(format!(
+            "tup-pt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = dir.join("resolv.conf");
+        std::fs::write(&t, b"nameserver 1.1.1.1\n").unwrap();
+        prepare_target(&t, &t).unwrap(); // src is a non-dir, target exists -> no-op
+        assert_eq!(std::fs::read(&t).unwrap(), b"nameserver 1.1.1.1\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

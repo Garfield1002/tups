@@ -306,7 +306,14 @@ pub(crate) fn wrap_pasta(net: Net, launcher: &str, args: &[OsString]) -> Command
                 .arg("--dns-forward")
                 .arg(PASTA_DNS)
                 .arg("--quiet");
-            c.arg("--").arg(launcher).args(args);
+            // pasta execs its very first child specially — before its own uid/gid map is in force
+            // for that execve — so a launcher binary owned by the (as-yet-unmapped) caller is
+            // refused with EACCES, while a root-owned one runs. Interpose root-owned /usr/bin/env:
+            // by the time env exec()s the launcher the map is live and the launcher reads as
+            // owner-root. env runs on the host, before the sandbox; it's a harmless no-op layer
+            // for the already-root-owned bwrap launcher too. The launcher path is absolute, so env
+            // never mistakes it for an option.
+            c.arg("--").arg("/usr/bin/env").arg(launcher).args(args);
             c
         }
         Net::Host | Net::None => {

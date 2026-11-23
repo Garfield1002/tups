@@ -107,7 +107,8 @@ const FLAKE: &str = r#"{
         name = "tup-env";
         paths = (pkgs.lib.concatMap (n: prologues.${n}) active) ++ extraPackages;
       };
-      # Plain data tup reads via `nix eval`: network, persist volumes, host binds ("links").
+      # Plain data tup reads via `nix eval`: network, persist volumes, host binds ("links"),
+      # and brokered credential agents.
       tup = {
         net = "pasta";
         persist = [
@@ -116,6 +117,12 @@ const FLAKE: &str = r#"{
         binds = [
           # { host = "/abs/host/path"; path = "/abs/container/path"; ro = true; }
         ];
+        # Credential agents forwarded into the container: tup binds a SOCKET to a host agent
+        # that holds the secret and brokers it — the key never enters the container. Each
+        # entry here is an explicit grant (deny-by-default: nothing forwarded unless named).
+        agents = {
+          # ssh.key = "tups-deploy";   # git/ssh auth via an ssh-agent holding only this key
+        };
       };
     };
 }
@@ -284,6 +291,8 @@ pub(crate) struct TupConfig {
     pub net: Option<Net>,
     pub persist: Vec<PathBuf>,
     pub binds: Vec<Bind>,
+    /// `agents.ssh.key`: the tup-managed deploy key whose ssh-agent should be forwarded.
+    pub ssh_agent_key: Option<String>,
 }
 
 /// Read and apply the flake's `tup` output (`nix eval --apply`, so no JSON dependency). A
@@ -295,6 +304,7 @@ pub(crate) fn read_tup_config(project: &str) -> TupConfig {
         net: None,
         persist: Vec::new(),
         binds: Vec::new(),
+        ssh_agent_key: None,
     };
     // Probe whether the flake has a `tup` output at all. Distinguish two failures that used to
     // collapse together: a flake that simply has no `tup` output (normal — e.g. host-authored)
@@ -360,10 +370,27 @@ pub(crate) fn read_tup_config(project: &str) -> TupConfig {
             Vec::new()
         }
     };
+    // agents.ssh.key — the deploy key whose agent to forward. `or ""` catches a missing
+    // agents/ssh/key at any level; a genuinely broken value warns (like persist/binds).
+    let ssh_agent_key = match nix_eval_tup(&flakeref, r#"c: c.agents.ssh.key or """#) {
+        Ok(s) => {
+            let s = s.trim().to_string();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        }
+        Err(e) => {
+            warn_tup("agents.ssh.key", &e);
+            None
+        }
+    };
     TupConfig {
         net,
         persist,
         binds,
+        ssh_agent_key,
     }
 }
 

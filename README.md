@@ -111,8 +111,26 @@ tup = {
   net = "pasta";                       # overrides the default net mode
   persist = [ "/var/lib/postgresql" ]; # rw dirs that survive teardown and ride a move
   binds = [ { path = "/etc/hosts"; ro = true; } ];  # host files to link in
+  agents.ssh.key = "tups-deploy";      # forward an ssh-agent so git works WITHOUT the key
 };
 ```
+
+### Credential agents (`outputs.tup.agents`) — use a key without holding it
+
+A container often needs to *use* a credential (git over ssh) but should never be able to
+*read* it. `agents` solves that by forwarding a **socket to a host agent**, not the secret:
+
+- `agents.ssh.key = "<name>"` tells tup to run a dedicated `ssh-agent` on the host holding
+  only the tup-managed deploy key `~/.tup/keys/<name>` (generated on first use; add its printed
+  public half to the repo as a deploy key once). tup binds *that agent's socket* into the
+  container and points `SSH_AUTH_SOCK` at it.
+- Inside the box, `git push` asks the agent to sign GitHub's challenge over the socket. **The
+  private key never enters the container**, and when the session ends the agent dies and the
+  capability is gone. The key is repo-scoped, so the capability is "push this one repo" — no
+  other host, no other repo.
+
+It's **deny-by-default**: with no `agents` entry, the container reaches no host credentials at
+all. Declaring one in the flake (which you review, like `binds`) *is* the grant.
 
 ### Hardening (`--harden`)
 

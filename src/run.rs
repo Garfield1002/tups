@@ -3,7 +3,8 @@
 use crate::net::{net_from_str, Net};
 use crate::nixenv::{self, env_mode_from_str, EnvMode};
 use crate::project::ensure_project_root;
-use crate::sandbox::{launch, Bind, Spec};
+use crate::sandbox::{launch, Bind, Spec, AGENT_SOCK};
+use crate::{agent, agent::Agent};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::exit;
@@ -80,6 +81,8 @@ pub(crate) fn cmd_run(args: &[String]) {
     };
     let root = ensure_project_root(&project);
     let chdir = chdir.unwrap_or_else(|| "/work".to_string());
+    let mut forward_agent = false;
+    let mut agent_handle: Option<Agent> = None;
     // Hermetic Nix env: realise the project's flake to a profile store path first (host side,
     // where nix + network + the store live).
     let profile: Option<PathBuf> = match env {
@@ -94,6 +97,21 @@ pub(crate) fn cmd_run(args: &[String]) {
             }
             extra.extend(nixenv::persist_binds(&project, &cfg.persist));
             extra.extend(cfg.binds);
+            // Credential agent (outputs.tup.agents.ssh): forward the socket, never the key.
+            if let Some(name) = &cfg.ssh_agent_key {
+                match agent::setup(name, &project) {
+                    Ok(a) => {
+                        extra.push(Bind {
+                            src: a.sock.clone(),
+                            dst: PathBuf::from(AGENT_SOCK),
+                            ro: false,
+                        });
+                        forward_agent = true;
+                        agent_handle = Some(a);
+                    }
+                    Err(e) => eprintln!("[tup] warning: ssh agent '{name}' not forwarded: {e}"),
+                }
+            }
             Some(p)
         }
         EnvMode::Host => None,
@@ -119,11 +137,17 @@ pub(crate) fn cmd_run(args: &[String]) {
         as_pid1: false,
         env,
         profile,
+        forward_agent,
         extra,
         inner,
     };
     let mut c = launch(spec);
-    match c.status() {
+    let result = c.status();
+    // Reap the forwarded agent now the container has exited (before we exit the process).
+    if let Some(a) = &agent_handle {
+        a.stop();
+    }
+    match result {
         Ok(status) => exit(status.code().unwrap_or(1)),
         Err(e) => {
             eprintln!("tup: failed to launch container: {e}");

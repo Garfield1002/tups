@@ -3,7 +3,8 @@
 use crate::net::{net_from_str, write_net, Net};
 use crate::nixenv::{self, env_mode_from_str, EnvMode};
 use crate::project::{ensure_project_root, project_dir};
-use crate::sandbox::{launch, Bind, Spec};
+use crate::sandbox::{launch, Bind, Spec, AGENT_SOCK};
+use crate::{agent, agent::Agent};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -127,6 +128,8 @@ pub(crate) fn cmd_up(args: &[String]) {
     let root = ensure_project_root(&project);
     // Hermetic Nix env: realise the flake first, then apply its `tup` output (net + binds).
     let mut tup_binds: Vec<Bind> = Vec::new();
+    let mut forward_agent = false;
+    let mut agent_handle: Option<Agent> = None;
     let profile = match env {
         EnvMode::Nix => {
             let p = nixenv::realize(&project);
@@ -138,6 +141,21 @@ pub(crate) fn cmd_up(args: &[String]) {
             }
             tup_binds = nixenv::persist_binds(&project, &cfg.persist);
             tup_binds.extend(cfg.binds);
+            // Credential agent (outputs.tup.agents.ssh): forward the socket, never the key.
+            if let Some(name) = &cfg.ssh_agent_key {
+                match agent::setup(name, &project) {
+                    Ok(a) => {
+                        tup_binds.push(Bind {
+                            src: a.sock.clone(),
+                            dst: PathBuf::from(AGENT_SOCK),
+                            ro: false,
+                        });
+                        forward_agent = true;
+                        agent_handle = Some(a);
+                    }
+                    Err(e) => eprintln!("[tup] warning: ssh agent '{name}' not forwarded: {e}"),
+                }
+            }
             Some(p)
         }
         EnvMode::Host => None,
@@ -176,6 +194,7 @@ pub(crate) fn cmd_up(args: &[String]) {
         as_pid1: true,
         env,
         profile,
+        forward_agent,
         extra,
         inner,
     };
@@ -217,5 +236,9 @@ pub(crate) fn cmd_up(args: &[String]) {
         eprintln!("tup: wait failed: {e}");
         exit(1);
     });
+    // Reap the forwarded agent now the supervised container has exited.
+    if let Some(a) = &agent_handle {
+        a.stop();
+    }
     exit(status.code().unwrap_or(0));
 }

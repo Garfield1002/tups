@@ -116,6 +116,9 @@ pub(crate) fn launch(spec: Spec) -> Command {
     if spec.as_pid1 {
         a.push("--as-pid1".into());
     }
+    if spec.forward_agent {
+        a.push("--ssh-agent".into());
+    }
     for b in &spec.extra {
         a.push(if b.ro { "--ro-bind" } else { "--bind" }.into());
         a.push(b.src.clone().into_os_string());
@@ -570,6 +573,7 @@ fn parse(args: &[OsString]) -> Spec {
     let mut chdir = "/work".to_string();
     let mut harden = false;
     let mut as_pid1 = false;
+    let mut forward_agent = false;
     let mut env = EnvMode::Host;
     let mut profile: Option<PathBuf> = None;
     let mut extra: Vec<Bind> = Vec::new();
@@ -612,6 +616,10 @@ fn parse(args: &[OsString]) -> Spec {
                 as_pid1 = true;
                 i += 1;
             }
+            Some("--ssh-agent") => {
+                forward_agent = true;
+                i += 1;
+            }
             Some("--bind") | Some("--ro-bind") => {
                 let ro = args[i].to_str() == Some("--ro-bind");
                 let s = req(args, i + 1, "bind src");
@@ -642,6 +650,7 @@ fn parse(args: &[OsString]) -> Spec {
         as_pid1,
         env,
         profile,
+        forward_agent,
         extra,
         inner,
     }

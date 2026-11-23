@@ -14,6 +14,12 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Where a forwarded credential-agent socket appears inside the container. The caller binds
+/// the host agent's socket here (via `extra`) and sets `forward_agent` so `SSH_AUTH_SOCK`
+/// points at it; the agent's key never enters the container. (A sibling of `/run/tup`, the
+/// supervisor binary — not under it, since that path is a file.)
+pub(crate) const AGENT_SOCK: &str = "/run/tup-agent.sock";
+
 /// A caller-supplied bind (the project tree, ~/.claude, the exe at /run/tup, …).
 pub(crate) struct Bind {
     pub src: PathBuf,
@@ -43,6 +49,8 @@ pub(crate) struct Spec {
     pub env: EnvMode,
     /// For `EnvMode::Nix`: the realised profile store path (its `/bin` becomes the whole PATH).
     pub profile: Option<PathBuf>,
+    /// A credential agent's socket is bound (via `extra`) at `AGENT_SOCK`; set `SSH_AUTH_SOCK`.
+    pub forward_agent: bool,
     pub extra: Vec<Bind>,
     pub inner: Vec<OsString>,
 }
@@ -270,6 +278,12 @@ pub(crate) fn env_pairs(spec: &Spec) -> Vec<(&'static str, String)> {
         // Preserve the terminal type across the env clear so interactive shells behave.
         v.push(("TERM", std::env::var("TERM").unwrap_or_else(|_| "xterm".into())));
     }
+    // Point ssh/git at the forwarded agent socket (set in both env modes; in Nix mode the host
+    // env was cleared, so this is the only SSH_AUTH_SOCK, and in host mode it overrides the
+    // inherited one, which points at a host path that isn't bound into the container).
+    if spec.forward_agent {
+        v.push(("SSH_AUTH_SOCK", AGENT_SOCK.to_string()));
+    }
     v
 }
 
@@ -312,4 +326,17 @@ pub(crate) fn launch(spec: Spec) -> Command {
         }
     }
     crate::bwrap::launch(spec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AGENT_SOCK;
+
+    #[test]
+    fn agent_sock_is_a_sibling_of_the_supervisor_binary() {
+        // /run/tup is the tup binary (a file); the agent socket must NOT be a child of it
+        // (that would need /run/tup to be a directory), but a sibling under /run.
+        assert!(!AGENT_SOCK.starts_with("/run/tup/"), "would collide with the /run/tup file");
+        assert!(AGENT_SOCK.starts_with("/run/"));
+    }
 }

@@ -20,6 +20,7 @@ use std::env;
 use std::ffi::OsString;
 use std::process::exit;
 
+mod agent;
 mod bwrap;
 #[cfg(feature = "pyrex")]
 mod pyrex;

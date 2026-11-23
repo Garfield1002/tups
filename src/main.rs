@@ -45,6 +45,8 @@ fn main() {
         "preflight" => migrate::cmd_preflight(&args[2..]),
         "ps" => status::cmd_ps(&args[2..]),
         "attach" => status::cmd_attach(&args[2..]),
+        "stop" => status::cmd_stop(&args[2..]),
+        "rm" => status::cmd_rm(&args[2..]),
         // Internal: the pyrex backend re-execs the tup binary as the sandbox launcher.
         "__sandbox" => cmd_sandbox(&args[2..]),
         "version" | "--version" | "-V" => println!("tup {VERSION}"),
@@ -80,6 +82,8 @@ COMMANDS:
     up  [--net M] [--env E] [--harden] <project>              PID-1 supervisor     [implemented]
     env <project> [list|add <p>|rm <p>]             inspect/edit env prologues     [implemented]
     ps                                              list projects and their state  [implemented]
+    stop <project>                                  clean-stop a running project   [implemented]
+    rm [--force] <project>                          delete a project's state       [implemented]
     move <project> <dest>                           migrate a session              [implemented]
     attach <project> [-- <cmd>]                     join a running container       [implemented]
     preflight <project>                             report the cost/loss of a move [implemented]

@@ -1,4 +1,5 @@
-//! `tup ps` — list projects and their state. `tup attach` — join a running container.
+//! Project lifecycle and inspection: `tup ps` (list), `tup attach` (join a running
+//! container), `tup stop` (clean shutdown), `tup rm` (delete project state).
 //!
 //! `attach` is the roaming-client reconnect: it `nsenter`s into the live container's
 //! namespaces (user first, so we gain caps in it, then mount/uts/ipc/pid/net) and runs a shell
@@ -11,8 +12,9 @@ use crate::up::find_init_pid;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
+use std::time::Duration;
 
 fn tup_home() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -160,5 +162,136 @@ pub(crate) fn cmd_attach(args: &[String]) {
             eprintln!("tup: nsenter failed: {e} (is util-linux installed?)");
             exit(1);
         }
+    }
+}
+
+/// `tup stop <project>` — cleanly stop a running project. We SIGTERM the sandbox PID 1 so
+/// `tup init` runs its quiesce (stop hooks, then the bounded SIGTERM→SIGKILL sweep) — never
+/// the monitor, whose pdeathsig would SIGKILL the tree and skip quiesce. Then we wait for
+/// PID 1 to exit. Idempotent: stopping an already-stopped project succeeds with a note.
+pub(crate) fn cmd_stop(args: &[String]) {
+    let project = match args.first() {
+        Some(p) => p.clone(),
+        None => {
+            eprintln!("usage: tup stop <project>");
+            exit(2);
+        }
+    };
+    let pid = match find_init_pid(&project) {
+        Some(p) => p,
+        None => {
+            println!("'{project}' is not running");
+            return;
+        }
+    };
+    eprintln!("[tup] stopping '{project}' (init pid {pid}) — running quiesce");
+    // SIGTERM to PID 1; it runs stop hooks and the sweep, then exits and disappears host-side.
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    for _ in 0..150 {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            println!("stopped '{project}'");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!("[tup] '{project}' still running after 15s; sending SIGKILL (quiesce may be incomplete)");
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+}
+
+/// `tup rm [--force] <project>` — delete a project's state dir (working tree + persist
+/// volumes + env). Safe by default: without `--force` it only reports what would be deleted,
+/// since `root/` holds the user's actual work. Refuses outright while the project is running.
+pub(crate) fn cmd_rm(args: &[String]) {
+    let mut force = false;
+    let mut name: Option<String> = None;
+    for a in args {
+        match a.as_str() {
+            "--force" | "-f" | "--yes" | "-y" => force = true,
+            _ if name.is_none() => name = Some(a.clone()),
+            _ => {}
+        }
+    }
+    let project = match name {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: tup rm [--force] <project>");
+            exit(2);
+        }
+    };
+    let dir = project_dir(&project);
+    if !dir.is_dir() {
+        eprintln!("tup: no such project '{project}' (nothing under {})", dir.display());
+        exit(1);
+    }
+    if let Some(pid) = find_init_pid(&project) {
+        eprintln!("tup: '{project}' is running (init pid {pid}) — run `tup stop {project}` first");
+        exit(1);
+    }
+    let bytes = dir_size(&dir);
+    if !force {
+        println!("tup rm would permanently delete '{project}':");
+        println!("  {}  ({})", dir.display(), human_bytes(bytes));
+        println!("this includes the working tree (root/) and any persist volumes.");
+        println!("re-run with --force to delete.");
+        return;
+    }
+    match fs::remove_dir_all(&dir) {
+        Ok(_) => println!("removed '{project}' ({})", human_bytes(bytes)),
+        Err(e) => {
+            eprintln!("tup: failed to remove {}: {e}", dir.display());
+            exit(1);
+        }
+    }
+}
+
+/// Sum of regular-file sizes under `p` (recursive; symlinks counted as their own small entry,
+/// never followed — so a persist bind-target outside the tree isn't double-counted or chased).
+fn dir_size(p: &Path) -> u64 {
+    let mut total = 0;
+    if let Ok(rd) = fs::read_dir(p) {
+        for e in rd.flatten() {
+            let ft = match e.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if ft.is_symlink() {
+                continue;
+            } else if ft.is_dir() {
+                total += dir_size(&e.path());
+            } else if let Ok(m) = e.metadata() {
+                total += m.len();
+            }
+        }
+    }
+    total
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut b = bytes as f64;
+    let mut i = 0;
+    while b >= 1024.0 && i < UNITS.len() - 1 {
+        b /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{b:.1} {}", UNITS[i])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_bytes_scales() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.0 KB");
+        assert_eq!(human_bytes(1536), "1.5 KB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
     }
 }

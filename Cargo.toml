@@ -8,6 +8,13 @@ description = "tupperware: small, weak, movable containers for coding agents —
 name = "tup"
 path = "src/main.rs"
 
+[features]
+default = []
+# Pyrex: an in-house namespace backend (a small, cooperative bubblewrap). Compiled in only with
+# `--features pyrex`, and still opt-in at runtime via TUP_SANDBOX=pyrex, so default builds are
+# unaffected. See src/pyrex.rs.
+pyrex = []
+
 [profile.release]
 opt-level = "z"
 lto = true

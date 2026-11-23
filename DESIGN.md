@@ -45,24 +45,32 @@ agents author the flake, the user never has to read it. The only thing a flake d
 (links / network / persist) lives as **plain data in a flake output: `outputs.tup = { ... }`**.
 One source of truth, one evaluator (Nix), no second format.
 
-**Implemented — piece 1, hermetic (`src/nixenv.rs`).** `tup run --env nix <project>` (also
+**Implemented — pieces 1–3, hermetic (`src/nixenv.rs`).** `tup run --env nix <project>` (also
 `tup up --env nix`) makes the environment the project's flake, fully hermetic:
 
-- The flake lives at `~/.tup/<project>/env/flake.nix` (a default base prologue — bash,
-  coreutils, cacert, gitMinimal, ripgrep, curl — is written on first use). tup builds its
-  `tupEnv` output (a `buildEnv`) host-side via `nix build`, pinning a `flake.lock`, and
-  resolves the `profile` out-link to a store path.
-- The sandbox then **drops the host `/usr`/`/etc` entirely**. The closure is already in the
-  shared ro `/nix/store` bind, so realising the env copies nothing; it only adds a synthesized
-  `/etc` (passwd/group/resolv.conf) and symlinks the two paths the world hardcodes —
-  `/bin/sh` and `/usr/bin/env` — into the profile. PATH is just `<profile>/bin`; the host env
-  is wiped (`--clearenv` / explicit clear) and replaced with PATH + HOME + SSL_CERT_FILE.
-- Lives behind the `env` field on `Spec`, so **both backends render it** (verified: bwrap and
-  pyrex produce an identical hermetic root — same profile store path, `/usr/bin` holding only
-  `env`, no host leak, `#!/usr/bin/env` shebangs working). Default stays `--env host`.
+- *(piece 1)* The flake lives at `~/.tup/<project>/env/flake.nix`. tup builds its `tupEnv`
+  output (a `buildEnv`) host-side via `nix build`, pinning a `flake.lock`, and resolves the
+  `profile` out-link to a store path. The sandbox then **drops the host `/usr`/`/etc`
+  entirely**. The closure is already in the shared ro `/nix/store` bind, so realising the env
+  copies nothing; it only adds a synthesized `/etc` (passwd/group/resolv.conf) and symlinks the
+  two paths the world hardcodes — `/bin/sh` and `/usr/bin/env` — into the profile. PATH is just
+  `<profile>/bin`; the host env is wiped (`--clearenv` / explicit clear) and replaced with
+  PATH + HOME + SSL_CERT_FILE. Lives behind the `env` field on `Spec`, so **both backends
+  render it** (verified: bwrap and pyrex produce an identical hermetic root).
+- *(piece 2 — prologues)* The env is composed from named, reusable profiles: a generic `base`
+  every project inherits, plus opt-in language prologues (`rust`, `python`, `node`, `go`, `c`,
+  `lean`). The registry lives in `prologues.nix` and the selection in `active.nix` (both
+  tup-owned data the stable `flake.nix` imports), so the flake is generated once and then the
+  user's to edit, while `tup env <project> [list|add|rm]` manages the selection without ever
+  rewriting the flake. Sharing across projects is automatic via store dedup — no shared flake.
+- *(piece 3 — `outputs.tup`)* The one thing a flake doesn't model — network + host binds
+  ("links") — lives as plain data in the flake's `tup` output (`{ net; binds; }`). tup reads it
+  with `nix eval --apply` (no JSON dependency) and applies it: `net` sets the default network
+  mode (an explicit `--net` still wins) and `binds` become sandbox binds. Verified: a flake
+  declaring `net = "none"` + a host bind is honoured by `tup run` with no CLI flags.
 
-Still deferred: prologues as composable named profiles, `outputs.tup` plain-data for
-links/net/persist, and `nix copy --to ssh://` as the move transport.
+Still deferred: `outputs.tup.persist` (volumes — its own slice) and `nix copy --to ssh://` as
+the `tup move` closure transport.
 
 ### Prologues
 
@@ -229,8 +237,9 @@ Everything except the move round-trip is assembling known-good parts. Prove the 
 5. **`tup move` + `tup preflight`** — the between-turn migration round-trip over SSH.
 6. **`tup attach`** — roaming client reattach.
 7. **Nix env integration** — flake eval → store paths → bind-mount; prologues.
-   *(piece 1 done: hermetic `--env nix` — flake → profile → PATH is just the profile, host
-   /usr dropped. Prologues / outputs.tup / nix-copy transport still to come.)*
+   *(pieces 1–3 done: hermetic `--env nix` — flake → profile → PATH is just the profile, host
+   /usr dropped; prologues (base + opt-in languages, `tup env`); `outputs.tup` net + binds.
+   Remaining: `outputs.tup.persist` volumes and `nix copy` move transport.)*
 
 ## Decision log (what the grilling settled)
 

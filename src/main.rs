@@ -37,6 +37,7 @@ fn main() {
     match args.get(1).map(String::as_str).unwrap_or("help") {
         "run" => run::cmd_run(&args[2..]),
         "up" => up::cmd_up(&args[2..]),
+        "env" => nixenv::cmd_env(&args[2..]),
         "init" => init::cmd_init(&args[2..]),
         "move" => migrate::cmd_move(&args[2..]),
         "preflight" => migrate::cmd_preflight(&args[2..]),
@@ -82,8 +83,9 @@ USAGE:
     tup <command> [args]
 
 COMMANDS:
-    run [--net M] [--harden] <project> [-- <cmd>]   run a command in a namespace  [implemented]
-    up  [--net M] [--harden] <project>              launch a PID-1 supervisor      [implemented]
+    run [--net M] [--env E] [--harden] <project> [-- <cmd>]   run in a namespace   [implemented]
+    up  [--net M] [--env E] [--harden] <project>              PID-1 supervisor     [implemented]
+    env <project> [list|add <p>|rm <p>]             inspect/edit env prologues     [implemented]
     ps                                              list running projects          [planned]
     move <project> <dest>                           migrate a session              [implemented]
     attach <project>                                attach a roaming client        [planned]
@@ -95,7 +97,8 @@ COMMANDS:
     --net none   isolated netns, loopback only, no egress
     --env host   (default) inherit the host /usr + /etc
     --env nix    hermetic: the project's flake IS the env; drop host /usr, PATH is the
-                 profile's bin. Writes a default flake on first use; needs nix on PATH.
+                 profile's bin. Composed from prologues (base + opt-in languages); the
+                 flake's `tup` output supplies net + host binds. Needs nix on PATH.
     --harden     drop all capabilities (--cap-drop ALL) + new session (TTY-injection proof).
                  We don't advertise security; this just lowers the escape stakes.
 

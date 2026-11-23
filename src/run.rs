@@ -15,6 +15,7 @@ pub(crate) fn cmd_run(args: &[String]) {
     };
 
     let mut net = Net::Pasta;
+    let mut net_explicit = false;
     let mut chdir: Option<String> = None;
     let mut harden = false;
     let mut env = EnvMode::Host;
@@ -25,6 +26,7 @@ pub(crate) fn cmd_run(args: &[String]) {
         match opts[i].as_str() {
             "--net" => {
                 net = net_from_str(opts.get(i + 1).map(String::as_str));
+                net_explicit = true;
                 i += 2;
             }
             "--env" => {
@@ -81,7 +83,18 @@ pub(crate) fn cmd_run(args: &[String]) {
     // Hermetic Nix env: realise the project's flake to a profile store path first (host side,
     // where nix + network + the store live).
     let profile: Option<PathBuf> = match env {
-        EnvMode::Nix => Some(nixenv::realize(&project)),
+        EnvMode::Nix => {
+            let p = nixenv::realize(&project);
+            // Apply the flake's `tup` plain-data output: net (unless overridden) + host binds.
+            let cfg = nixenv::read_tup_config(&project);
+            if !net_explicit {
+                if let Some(n) = cfg.net {
+                    net = n;
+                }
+            }
+            extra.extend(cfg.binds);
+            Some(p)
+        }
         EnvMode::Host => None,
     };
     let inner: Vec<OsString> = if cmd.is_empty() {

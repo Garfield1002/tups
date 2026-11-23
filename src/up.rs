@@ -86,6 +86,7 @@ pub(crate) fn poll_init_pid(project: &str, tries: u32) -> Option<i32> {
 
 pub(crate) fn cmd_up(args: &[String]) {
     let mut net = Net::Pasta;
+    let mut net_explicit = false;
     let mut harden = false;
     let mut env = EnvMode::Host;
     let mut rest: Vec<String> = Vec::new();
@@ -94,6 +95,7 @@ pub(crate) fn cmd_up(args: &[String]) {
         match args[i].as_str() {
             "--net" => {
                 net = net_from_str(args.get(i + 1).map(String::as_str));
+                net_explicit = true;
                 i += 2;
             }
             "--env" => {
@@ -116,6 +118,22 @@ pub(crate) fn cmd_up(args: &[String]) {
     }
     let project = rest[0].clone();
     let root = ensure_project_root(&project);
+    // Hermetic Nix env: realise the flake first, then apply its `tup` output (net + binds).
+    let mut tup_binds: Vec<Bind> = Vec::new();
+    let profile = match env {
+        EnvMode::Nix => {
+            let p = nixenv::realize(&project);
+            let cfg = nixenv::read_tup_config(&project);
+            if !net_explicit {
+                if let Some(n) = cfg.net {
+                    net = n;
+                }
+            }
+            tup_binds = cfg.binds;
+            Some(p)
+        }
+        EnvMode::Host => None,
+    };
     write_net(&project, net); // so `tup move` restores this net mode, not the pasta default
     let exe = env::current_exe().unwrap_or_else(|e| {
         eprintln!("tup: cannot find own path: {e}");
@@ -135,15 +153,12 @@ pub(crate) fn cmd_up(args: &[String]) {
             ro: true,
         });
     }
+    extra.extend(tup_binds); // host binds declared in the flake's `tup` output
     let inner: Vec<OsString> = ["/run/tup", "init", &project]
         .iter()
         .map(OsString::from)
         .collect();
 
-    let profile = match env {
-        EnvMode::Nix => Some(nixenv::realize(&project)),
-        EnvMode::Host => None,
-    };
     let spec = Spec {
         root,
         project: project.clone(),

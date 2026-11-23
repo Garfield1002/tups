@@ -101,12 +101,64 @@ fn preflight_report(project: &str) {
             eprintln!("              {} {}", if b.ro { "ro" } else { "rw" }, b.src.display());
         }
     }
+    // Move dial: derived/cache dirs a remote move rebuilds on the target instead of shipping.
+    let excludes = payload_excludes(project, false);
+    if excludes.is_empty() {
+        eprintln!("  move-dial : --ship-all or move.ship covers everything; the full tree ships");
+    } else {
+        let (matched, saved) = rebuild_savings(&root, &excludes);
+        eprintln!(
+            "  rebuild   : {} pattern(s) not shipped over the wire (target rebuilds): {}",
+            excludes.len(),
+            excludes.join(" ")
+        );
+        if matched.is_empty() {
+            eprintln!("              none present in this tree — full payload ships");
+        } else {
+            for (name, sz) in &matched {
+                eprintln!("              {name}  ({})", human(*sz));
+            }
+            eprintln!(
+                "              ≈ {} saved; ≈ {} ships over the wire (`--ship-all` to send all)",
+                human(saved),
+                human(bytes.saturating_sub(saved))
+            );
+        }
+    }
     eprintln!(
         "  undeclared: enumerated at quiesce — stop hooks run, then survivors get SIGTERM then SIGKILL"
     );
     eprintln!(
         "  caches    : reachability from the target is not checked here; a cold cache makes resume honest-but-slow"
     );
+}
+
+/// Estimate the move dial's effect: top-level working-tree entries whose name matches an exclude
+/// pattern, with their sizes, and the total bytes thus kept off the wire. Top-level only, so it's
+/// an approximation (a `node_modules` nested in a monorepo subdir isn't counted here).
+fn rebuild_savings(root: &Path, excludes: &[String]) -> (Vec<(String, u64)>, u64) {
+    let tokens: Vec<&str> = excludes
+        .iter()
+        .filter(|p| !p.contains('*'))
+        .map(|p| p.trim_end_matches('/'))
+        .collect();
+    let mut matched = Vec::new();
+    let mut saved = 0u64;
+    if let Ok(rd) = std::fs::read_dir(root) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if tokens.iter().any(|t| *t == name) {
+                let sz = if e.path().is_dir() {
+                    dir_size(&e.path())
+                } else {
+                    e.metadata().map(|m| m.len()).unwrap_or(0)
+                };
+                saved += sz;
+                matched.push((name, sz));
+            }
+        }
+    }
+    (matched, saved)
 }
 
 pub(crate) fn cmd_preflight(args: &[String]) {
@@ -352,16 +404,19 @@ fn nix_copy(dest: &str, profile: &Path) {
 
 pub(crate) fn cmd_move(args: &[String]) {
     let mut force = false;
+    let mut ship_all = false;
     let mut pos: Vec<&String> = Vec::new();
     for a in args {
-        if a == "--force" {
-            force = true;
-        } else {
-            pos.push(a);
+        match a.as_str() {
+            "--force" => force = true,
+            "--ship-all" => ship_all = true,
+            _ => pos.push(a),
         }
     }
     if pos.len() < 2 {
-        eprintln!("usage: tup move [--force] <project> <local:<newproject> | [user@]host>");
+        eprintln!(
+            "usage: tup move [--force] [--ship-all] <project> <local:<newproject> | [user@]host>"
+        );
         exit(2);
     }
     let project = pos[0].as_str();
@@ -391,9 +446,77 @@ pub(crate) fn cmd_move(args: &[String]) {
     quiesce_source(project);
 
     match dest.strip_prefix("local:") {
+        // A local move hardlinks via rsync --link-dest, so shipping the full tree is nearly free;
+        // the rebuild-vs-rsync dial only pays off over the wire, so it applies to remote moves.
         Some(newproj) => local_move(project, newproj),
-        None => remote_move(project, dest),
+        None => remote_move(project, dest, ship_all),
     }
+}
+
+/// Derived/cache dirs left OUT of the move payload by default — the target rebuilds or refetches
+/// them (cheaper than shipping gigabytes over ssh when the caches are networked). Overridable per
+/// project via `outputs.tup.move.{ship,rebuild}` and globally by `tup move --ship-all`. These are
+/// rsync filter patterns matched against the working tree at any depth (monorepo-friendly).
+const DEFAULT_REBUILD: &[&str] = &[
+    "target/",
+    "node_modules/",
+    ".venv/",
+    "venv/",
+    "__pycache__/",
+    "*.pyc",
+    ".mypy_cache/",
+    ".pytest_cache/",
+    ".ruff_cache/",
+    ".cache/",
+    "dist/",
+    "build/",
+    ".next/",
+    ".turbo/",
+    ".parcel-cache/",
+];
+
+/// Normalize a user move-path (`/work/x`, `x/`, `/x`) to a bare dir token (`x`) so it can be
+/// matched against [`DEFAULT_REBUILD`] basenames.
+fn move_token(p: &str) -> String {
+    let p = p.trim();
+    let p = p.strip_prefix("/work/").unwrap_or(p);
+    p.trim_matches('/').to_string()
+}
+
+/// The rsync exclude patterns for the working-tree payload: the built-in derived-dir defaults
+/// plus the flake's `move.rebuild`, minus anything the flake's `move.ship` asks to keep. Empty
+/// when `ship_all`.
+fn payload_excludes(project: &str, ship_all: bool) -> Vec<String> {
+    let pol = nixenv::read_move_policy(project);
+    compute_excludes(&pol.ship, &pol.rebuild, ship_all)
+}
+
+/// Pure core of the move dial: fold the built-in defaults with the flake's `ship`/`rebuild`.
+/// `ship` removes a default (keep it in the payload); `rebuild` adds a pattern; `ship_all` wins.
+fn compute_excludes(ship: &[String], rebuild: &[String], ship_all: bool) -> Vec<String> {
+    if ship_all {
+        return Vec::new();
+    }
+    let shipped: Vec<String> = ship.iter().map(|s| move_token(s)).collect();
+    let mut pats: Vec<String> = Vec::new();
+    for d in DEFAULT_REBUILD {
+        let tok = d.trim_end_matches('/');
+        if !shipped.iter().any(|s| s == tok) {
+            pats.push((*d).to_string());
+        }
+    }
+    for r in rebuild {
+        let tok = move_token(r);
+        if tok.is_empty() || pats.iter().any(|p| p.trim_end_matches('/') == tok) {
+            continue;
+        }
+        pats.push(if tok.contains('*') {
+            tok
+        } else {
+            format!("{tok}/")
+        });
+    }
+    pats
 }
 
 /// Stop the source (SIGTERM, then SIGKILL after 10s) and wait for PID 1 to be gone.
@@ -582,7 +705,7 @@ struct RStage {
     had_live: bool,
 }
 
-fn remote_move(project: &str, dest: &str) {
+fn remote_move(project: &str, dest: &str, ship_all: bool) {
     // Ship to ~/.tup/<project> on the remote (rsync remote paths are relative to $HOME). The
     // destination's live tree is never touched until every component has staged as `.incoming`
     // and the whole set swaps in at once; any failure rolls back and restarts the local source.
@@ -592,6 +715,19 @@ fn remote_move(project: &str, dest: &str) {
         restart_source(project);
         eprintln!("tup: couldn't prepare {dest}:{base}; nothing shipped, source '{project}' restarted");
         exit(1);
+    }
+
+    // The move dial: derived/cache dirs are left out of the working-tree payload so the target
+    // rebuilds them, unless --ship-all or the flake's move.ship overrides. Only the `root`
+    // component is filtered; persist/env/services/net always ship in full.
+    let root_excludes = payload_excludes(project, ship_all);
+    let root_ex_refs: Vec<&str> = root_excludes.iter().map(String::as_str).collect();
+    if !root_excludes.is_empty() {
+        eprintln!(
+            "[tup] move dial: not shipping {} derived path pattern(s) (target rebuilds): {}",
+            root_excludes.len(),
+            root_excludes.join(" ")
+        );
     }
 
     // (name, is_dir, excludes). env excludes the realised profile/etc (rebuilt from the flake).
@@ -607,6 +743,8 @@ fn remote_move(project: &str, dest: &str) {
         if !src_dir.join(name).exists() {
             continue;
         }
+        // The working tree carries the move dial's excludes; every other component ships whole.
+        let excl: &[&str] = if name == "root" { &root_ex_refs } else { excl };
         let had_live = remote_exists(dest, &format!("{base}/{name}"));
         let ok = if is_dir {
             stage_dir_remote(dest, &base, &src_dir, name, excl, had_live)
@@ -948,6 +1086,48 @@ mod tests {
 
         let cm = remote_commit_script(".tup/p", &staged);
         assert!(cm.contains("rm -rf root.rollback")); // parked copy dropped on success
+    }
+
+    fn owned(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn move_token_normalizes_paths() {
+        assert_eq!(move_token("/work/node_modules"), "node_modules");
+        assert_eq!(move_token("/target"), "target");
+        assert_eq!(move_token("dist/"), "dist");
+        assert_eq!(move_token("  build  "), "build");
+    }
+
+    #[test]
+    fn ship_all_excludes_nothing() {
+        assert!(compute_excludes(&[], &[], true).is_empty());
+        assert!(compute_excludes(&owned(&["x"]), &owned(&["y"]), true).is_empty());
+    }
+
+    #[test]
+    fn defaults_apply_with_no_policy() {
+        let ex = compute_excludes(&[], &[], false);
+        assert!(ex.contains(&"target/".to_string()));
+        assert!(ex.contains(&"node_modules/".to_string()));
+        assert_eq!(ex.len(), DEFAULT_REBUILD.len());
+    }
+
+    #[test]
+    fn ship_removes_a_default_and_rebuild_adds_one() {
+        // ship node_modules back into the payload; rebuild a bespoke generated dir.
+        let ex = compute_excludes(&owned(&["/work/node_modules"]), &owned(&["/work/gen"]), false);
+        assert!(!ex.iter().any(|p| p == "node_modules/"), "node_modules should ship: {ex:?}");
+        assert!(ex.contains(&"gen/".to_string()), "gen should be excluded: {ex:?}");
+        assert!(ex.contains(&"target/".to_string()), "other defaults stay");
+    }
+
+    #[test]
+    fn rebuild_is_deduped_against_defaults() {
+        // asking to rebuild target/ (already a default) must not duplicate the pattern.
+        let ex = compute_excludes(&[], &owned(&["target"]), false);
+        assert_eq!(ex.iter().filter(|p| p.trim_end_matches('/') == "target").count(), 1);
     }
 
     #[test]

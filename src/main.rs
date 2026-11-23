@@ -22,6 +22,7 @@ use std::process::exit;
 
 mod agent;
 mod bwrap;
+mod detect;
 mod gate;
 #[cfg(feature = "pyrex")]
 mod pyrex;

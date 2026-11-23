@@ -88,6 +88,9 @@ pub(crate) fn cmd_run(args: &[String]) {
     // where nix + network + the store live).
     let profile: Option<PathBuf> = match env {
         EnvMode::Nix => {
+            // Zero-config: if the prologue selection is still the untouched default, infer it
+            // from the working tree (Cargo.toml → rust, package.json → node, …) before building.
+            nixenv::auto_detect_prologues(&project);
             let p = nixenv::realize(&project);
             // Apply the flake's `tup` plain-data output: net (unless overridden) + host binds.
             let cfg = nixenv::read_tup_config(&project);

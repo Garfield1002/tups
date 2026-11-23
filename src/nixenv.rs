@@ -245,6 +245,79 @@ pub(crate) fn read_active(project: &str) -> Vec<String> {
     v
 }
 
+/// The project's working tree (`~/.tup/<project>/root`, mounted as `/work`), scanned for
+/// language marker files by the detector.
+fn work_root(project: &str) -> PathBuf {
+    project_dir(project).join("root")
+}
+
+/// Format the "detected: rust (Cargo.toml), node (package.json)" fragment.
+fn detected_summary(detected: &[(&'static str, &'static str)]) -> String {
+    detected
+        .iter()
+        .map(|(p, m)| format!("{p} ({m})"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Zero-config language detection: when the project's `active.nix` is still the untouched
+/// default (exactly `[ "base" ]`), infer prologues from the working tree, persist them, and
+/// print one line naming what was added. If the user has customised the selection at all, this
+/// is a no-op — their choice wins. Called from the `EnvMode::Nix` branch of `run`/`up` before
+/// `realize`, so the build picks up the inferred selection.
+pub(crate) fn auto_detect_prologues(project: &str) {
+    scaffold(project); // guarantee active.nix exists before we inspect it
+    let active = read_active(project);
+    // Only act on the untouched default. Anything else means the user chose (even just
+    // `tup env … add`/`rm`), so we never override.
+    if active.len() != 1 || active[0] != "base" {
+        return;
+    }
+    let detected = crate::detect::detect_with_markers(&work_root(project));
+    if detected.is_empty() {
+        return;
+    }
+    let mut new_active = vec!["base".to_string()];
+    for (p, _) in &detected {
+        new_active.push((*p).to_string());
+    }
+    let _ = std::fs::write(
+        env_dir(project).join("active.nix"),
+        render_active_nix(&new_active),
+    );
+    eprintln!(
+        "[tup] detected: {} → activating prologue{}",
+        detected_summary(&detected),
+        if detected.len() == 1 { "" } else { "s" }
+    );
+}
+
+/// `tup env <project> detect`: print detected prologues and merge them into `active.nix`
+/// (explicit opt-in — applies even when the selection was already customised).
+fn detect_cmd(project: &str) {
+    let detected = crate::detect::detect_with_markers(&work_root(project));
+    if detected.is_empty() {
+        println!("no language markers detected in {}", work_root(project).display());
+        return;
+    }
+    println!("detected: {}", detected_summary(&detected));
+    let mut active = read_active(project);
+    let mut added = Vec::new();
+    for (p, _) in &detected {
+        if !active.iter().any(|a| a == p) {
+            active.push((*p).to_string());
+            added.push(*p);
+        }
+    }
+    let _ = std::fs::write(env_dir(project).join("active.nix"), render_active_nix(&active));
+    if added.is_empty() {
+        println!("active prologues: {} (already current)", active.join(" "));
+    } else {
+        println!("active prologues: {}", active.join(" "));
+        println!("(run `tup run --env nix {project}` to rebuild)");
+    }
+}
+
 /// Host side: ensure the scaffolding exists, build the flake, and return the realised profile
 /// store path. Exits with a message on any failure.
 pub(crate) fn realize(project: &str) -> PathBuf {
@@ -454,6 +527,41 @@ pub(crate) fn read_gate(project: &str) -> Option<GatePolicy> {
     })
 }
 
+/// The move dial (`outputs.tup.move`): paths to force INTO the rsync payload (`ship`) and paths
+/// to force OUT so the target rebuilds/refetches them (`rebuild`). Empty for a host project or a
+/// flake with no `move` stanza — the move then uses only the built-in derived-dir defaults.
+pub(crate) struct MovePolicy {
+    pub ship: Vec<String>,
+    pub rebuild: Vec<String>,
+}
+
+/// Read `outputs.tup.move.{ship,rebuild}`. Host projects (no flake) return empty without
+/// touching nix, exactly like [`read_tup_config`].
+pub(crate) fn read_move_policy(project: &str) -> MovePolicy {
+    let empty = MovePolicy {
+        ship: Vec::new(),
+        rebuild: Vec::new(),
+    };
+    if !is_nix_project(project) {
+        return empty;
+    }
+    let flakeref = env_dir(project).display().to_string();
+    let list = |apply: &str| -> Vec<String> {
+        nix_eval_tup(&flakeref, apply)
+            .map(|s| {
+                s.lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(|l| l.trim().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    MovePolicy {
+        ship: list(r#"c: builtins.concatStringsSep "\n" (c.move.ship or [])"#),
+        rebuild: list(r#"c: builtins.concatStringsSep "\n" (c.move.rebuild or [])"#),
+    }
+}
+
 /// Evaluate `apply` against the flake's `tup` output. `Ok` on success, `Err(stderr)` when the
 /// eval fails (a missing `tup` output, or a mistake in the user's `tup` data).
 fn nix_eval_tup(flakeref: &str, apply: &str) -> Result<String, String> {
@@ -580,8 +688,9 @@ pub(crate) fn cmd_env(args: &[String]) {
         }
         Some("add") => edit(&project, &args[2..], true),
         Some("rm") => edit(&project, &args[2..], false),
+        Some("detect") => detect_cmd(&project),
         Some(other) => {
-            eprintln!("tup env: unknown subcommand '{other}' (want list|add|rm)");
+            eprintln!("tup env: unknown subcommand '{other}' (want list|add|rm|detect)");
             exit(2);
         }
     }

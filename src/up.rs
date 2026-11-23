@@ -133,6 +133,9 @@ pub(crate) fn cmd_up(args: &[String]) {
     let mut gate_handle: Option<Gate> = None;
     let profile = match env {
         EnvMode::Nix => {
+            // Zero-config: infer the prologue selection from the working tree when it is still
+            // the untouched default, before realising the env.
+            nixenv::auto_detect_prologues(&project);
             let p = nixenv::realize(&project);
             let cfg = nixenv::read_tup_config(&project);
             if !net_explicit {

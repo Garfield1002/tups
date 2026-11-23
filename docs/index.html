@@ -190,6 +190,7 @@
       <table>
         <thead><tr><th></th><th>Typical container</th><th>tup</th></tr></thead>
         <tbody>
+          <tr><th>Isolation</th><td class="old">strong, multi-tenant</td><td class="old">guards against accidents, not a malicious escape</td></tr>
           <tr><th>Needs</th><td class="old">image build, daemon, root</td><td class="tup"><strong>user namespaces, nothing else</strong></td></tr>
           <tr><th>The agent's files</th><td class="old">a copy inside the image</td><td class="tup"><strong>your real working tree, bind-mounted</strong></td></tr>
           <tr><th>Startup</th><td class="old">seconds</td><td class="tup"><strong>~10 ms</strong></td></tr>

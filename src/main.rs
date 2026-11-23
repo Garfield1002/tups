@@ -67,10 +67,11 @@ fn main() {
         "attach" => status::cmd_attach(&rest),
         "stop" => status::cmd_stop(&rest),
         "rm" => status::cmd_rm(&rest),
-        // Container-side gate drivers: ask the host gatekeeper to run the filtered op.
-        "push" => gate::drive("push", &rest),
-        "fetch" => gate::drive("fetch", &rest),
-        // Host-side standalone gatekeeper (bootstrap / non-flake use).
+        // Container-side git-gate aliases: ask the host gatekeeper to run the filtered op.
+        "push" => gate::drive_git("push", &rest),
+        "fetch" => gate::drive_git("fetch", &rest),
+        // `tup gate <name> [args]` drives any named gate (container side); `tup gate serve`
+        // runs a standalone git gatekeeper (host side, bootstrap / non-flake use).
         "gate" => gate::cmd_gate(&rest),
         "version" | "--version" | "-V" => println!("tup {VERSION}"),
         "help" | "--help" | "-h" => print_help(),
@@ -108,6 +109,7 @@ COMMANDS:
     stop <project>                                  clean-stop a running project   [implemented]
     rm [--force] <project>                          delete a project's state       [implemented]
     push [<ref>] / fetch [<ref>]       drive the project's git gate (host does the op) [implemented]
+    gate <name> [args…]                drive a named gate (git built-in or user-defined) [implemented]
     gate serve --remote U --allow push --sock P [--tree D] [--refs R]  run a gatekeeper [implemented]
     move <project> <dest>                           migrate a session              [implemented]
     attach <project> [-- <cmd>]                     join a running container       [implemented]

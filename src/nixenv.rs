@@ -15,7 +15,7 @@
 //!     ("links") — lives as plain data in the flake's `tup` output, which tup reads with
 //!     `nix eval` and applies.
 
-use crate::gate::GatePolicy;
+use crate::gate::{GateKind, GatePolicy, GateSpec};
 use crate::net::Net;
 use crate::project::{ensure_project_root, project_dir};
 use crate::sandbox::Bind;
@@ -426,32 +426,94 @@ pub(crate) fn read_tup_config(project: &str) -> TupConfig {
     }
 }
 
-/// Read the project's `gates.git` policy, if declared. `None` when there is no gate (no
-/// `gates.git.remote`) — the remote is the required, container-unspecifiable target.
-pub(crate) fn read_gate(project: &str) -> Option<GatePolicy> {
-    let flakeref = env_dir(project).display().to_string();
-    let remote = nix_eval_tup(&flakeref, r#"c: c.gates.git.remote or """#)
-        .ok()?
-        .trim()
-        .to_string();
-    if remote.is_empty() {
-        return None;
+/// The Nix expression that flattens every attr under `outputs.tup.gates` to one line apiece, so
+/// Rust can parse without a JSON dependency (mirrors the `nix eval --apply` style used above).
+/// A gate's `kind` defaults to "git" for the attr named `git`; otherwise it must be declared.
+/// List fields (allow/refs) are comma-joined (gate ops/args/refspecs never contain commas).
+/// Lines are tab-separated:
+///   git gate:     `git\t<name>\t<remote>\t<allow csv>\t<refs csv>`
+///   command gate: `command\t<name>\t<run>\t<allow csv>`
+///   unknown kind: `unknown\t<name>\t<kind>`  (warned and skipped in Rust)
+const GATES_APPLY: &str = r#"c:
+let
+  gates = c.gates or {};
+  names = builtins.attrNames gates;
+  line = n:
+    let g = gates.${n};
+        kind = g.kind or (if n == "git" then "git" else "");
+    in
+      if kind == "git" then
+        "git\t${n}\t${g.remote or ""}\t${builtins.concatStringsSep "," (g.allow or [])}\t${builtins.concatStringsSep "," (g.refs or [])}"
+      else if kind == "command" then
+        "command\t${n}\t${g.run or ""}\t${builtins.concatStringsSep "," (g.allow or [])}"
+      else
+        "unknown\t${n}\t${kind}";
+in builtins.concatStringsSep "\n" (map line names)"#;
+
+/// Read every declared gate under `outputs.tup.gates`. Returns the git built-in and any
+/// user-defined command gates; empty when the project is not a Nix project, has no `tup`/`gates`
+/// output, or the eval fails. A gate with a missing required field (git `remote`, command `run`)
+/// or an unknown `kind` is warned about and skipped rather than failing the whole launch.
+pub(crate) fn read_gates(project: &str) -> Vec<GateSpec> {
+    if !is_nix_project(project) {
+        return Vec::new();
     }
-    let list = |apply: &str| -> Vec<String> {
-        nix_eval_tup(&flakeref, apply)
-            .map(|s| {
-                s.lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .map(|l| l.trim().to_string())
-                    .collect()
-            })
-            .unwrap_or_default()
+    let flakeref = env_dir(project).display().to_string();
+    let out = match nix_eval_tup(&flakeref, GATES_APPLY) {
+        Ok(s) => s,
+        Err(e) => {
+            // A flake with no `tup` output (or no gates) is normal — stay quiet. A genuine error
+            // in the user's gate data is surfaced so a typo isn't swallowed silently.
+            if !e.contains("does not provide attribute") {
+                warn_tup("gates", &e);
+            }
+            return Vec::new();
+        }
     };
-    Some(GatePolicy {
-        remote,
-        allow: list(r#"c: builtins.concatStringsSep "\n" (c.gates.git.allow or [])"#),
-        refs: list(r#"c: builtins.concatStringsSep "\n" (c.gates.git.refs or [])"#),
-    })
+    let csv = |s: &str| -> Vec<String> {
+        s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
+    };
+    let mut specs = Vec::new();
+    for line in out.lines().filter(|l| !l.trim().is_empty()) {
+        let f: Vec<&str> = line.split('\t').collect();
+        match f.first().copied() {
+            Some("git") if f.len() == 5 => {
+                let remote = f[2].trim().to_string();
+                if remote.is_empty() {
+                    eprintln!("[tup] warning: ignoring gate '{}' — a git gate needs a remote", f[1]);
+                    continue;
+                }
+                specs.push(GateSpec {
+                    name: f[1].to_string(),
+                    kind: GateKind::Git(GatePolicy {
+                        remote,
+                        allow: csv(f[3]),
+                        refs: csv(f[4]),
+                    }),
+                });
+            }
+            Some("command") if f.len() == 4 => {
+                let run = f[2].trim().to_string();
+                if run.is_empty() {
+                    eprintln!("[tup] warning: ignoring gate '{}' — a command gate needs a `run`", f[1]);
+                    continue;
+                }
+                specs.push(GateSpec {
+                    name: f[1].to_string(),
+                    kind: GateKind::Command { run, allow: csv(f[3]) },
+                });
+            }
+            Some("unknown") => {
+                eprintln!(
+                    "[tup] warning: ignoring gate '{}' — unknown kind '{}' (want \"git\" or \"command\")",
+                    f.get(1).copied().unwrap_or(""),
+                    f.get(2).copied().unwrap_or("")
+                );
+            }
+            _ => eprintln!("[tup] warning: dropping malformed gate line: {line:?}"),
+        }
+    }
+    specs
 }
 
 /// Evaluate `apply` against the flake's `tup` output. `Ok` on success, `Err(stderr)` when the

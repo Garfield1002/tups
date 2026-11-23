@@ -3,7 +3,7 @@
 use crate::net::{net_from_str, write_net, Net};
 use crate::nixenv::{self, env_mode_from_str, EnvMode};
 use crate::project::{ensure_project_root, project_dir};
-use crate::sandbox::{launch, Bind, Spec, AGENT_SOCK, GATE_SOCK};
+use crate::sandbox::{launch, Bind, Spec, AGENT_SOCK, GATE_DIR};
 use crate::{agent, agent::Agent, gate, gate::Gate};
 use std::env;
 use std::ffi::OsString;
@@ -130,7 +130,7 @@ pub(crate) fn cmd_up(args: &[String]) {
     let mut tup_binds: Vec<Bind> = Vec::new();
     let mut forward_agent = false;
     let mut agent_handle: Option<Agent> = None;
-    let mut gate_handle: Option<Gate> = None;
+    let mut gate_handles: Vec<Gate> = Vec::new();
     let profile = match env {
         EnvMode::Nix => {
             let p = nixenv::realize(&project);
@@ -157,19 +157,26 @@ pub(crate) fn cmd_up(args: &[String]) {
                     Err(e) => eprintln!("[tup] warning: ssh agent '{name}' not forwarded: {e}"),
                 }
             }
-            // Gate (outputs.tup.gates.git): start the host gatekeeper, forward only its socket.
-            if let Some(policy) = nixenv::read_gate(&project) {
-                match gate::spawn(policy, &project, root.clone()) {
+            // Gates (outputs.tup.gates): start each declared host gatekeeper (git built-in +
+            // user-defined command gates), then forward the whole gate dir (one <name>.sock each).
+            let gates = nixenv::read_gates(&project);
+            let mut started_any_gate = false;
+            for spec in gates {
+                let name = spec.name.clone();
+                match gate::spawn(spec, &project, root.clone()) {
                     Ok(g) => {
-                        tup_binds.push(Bind {
-                            src: g.sock.clone(),
-                            dst: PathBuf::from(GATE_SOCK),
-                            ro: false,
-                        });
-                        gate_handle = Some(g);
+                        gate_handles.push(g);
+                        started_any_gate = true;
                     }
-                    Err(e) => eprintln!("[tup] warning: git gate not started: {e}"),
+                    Err(e) => eprintln!("[tup] warning: gate '{name}' not started: {e}"),
                 }
+            }
+            if started_any_gate {
+                tup_binds.push(Bind {
+                    src: gate::gates_dir(&project),
+                    dst: PathBuf::from(GATE_DIR),
+                    ro: false,
+                });
             }
             Some(p)
         }
@@ -228,7 +235,7 @@ pub(crate) fn cmd_up(args: &[String]) {
             if let Some(a) = &agent_handle {
                 a.stop();
             }
-            if let Some(g) = &gate_handle {
+            for g in &gate_handles {
                 g.stop();
             }
             exit(1);
@@ -259,7 +266,7 @@ pub(crate) fn cmd_up(args: &[String]) {
         if let Some(a) = &agent_handle {
             a.stop();
         }
-        if let Some(g) = &gate_handle {
+        for g in &gate_handles {
             g.stop();
         }
         exit(1);
@@ -268,7 +275,7 @@ pub(crate) fn cmd_up(args: &[String]) {
     if let Some(a) = &agent_handle {
         a.stop();
     }
-    if let Some(g) = &gate_handle {
+    for g in &gate_handles {
         g.stop();
     }
     // A child killed by a signal has no exit code; report non-zero, not a false success.

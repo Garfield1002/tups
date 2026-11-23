@@ -287,7 +287,8 @@ pub(crate) struct TupConfig {
 }
 
 /// Read and apply the flake's `tup` output (`nix eval --apply`, so no JSON dependency). A
-/// missing or malformed `tup` output yields an empty config rather than an error.
+/// flake with no `tup` output yields an empty config; a `tup` output that *exists but fails to
+/// evaluate* is a hard error (see the probe below) rather than a silent empty config.
 pub(crate) fn read_tup_config(project: &str) -> TupConfig {
     let flakeref = env_dir(project).display().to_string();
     let empty = TupConfig {
@@ -295,11 +296,21 @@ pub(crate) fn read_tup_config(project: &str) -> TupConfig {
         persist: Vec::new(),
         binds: Vec::new(),
     };
-    // Probe whether the flake has a `tup` output at all. If not, that's normal (e.g. a
-    // host-authored flake) — return empty silently. If it does, a per-field failure below is a
-    // real mistake in the user's `tup` data, so we surface it rather than dropping data quietly.
-    if nix_eval_tup(&flakeref, r#"c: """#).is_err() {
-        return empty;
+    // Probe whether the flake has a `tup` output at all. Distinguish two failures that used to
+    // collapse together: a flake that simply has no `tup` output (normal — e.g. host-authored)
+    // returns empty silently; but a `tup` output that exists and *throws* (or nix erroring for
+    // any other reason) must NOT be treated as "no config" — that would silently drop declared
+    // persist volumes (writes to them would land in the ephemeral root and be lost). Fail loudly.
+    if let Err(e) = nix_eval_tup(&flakeref, r#"c: """#) {
+        if e.contains("does not provide attribute") {
+            return empty; // no `tup` output — legitimately nothing to apply
+        }
+        eprintln!(
+            "[tup] error: the flake's `tup` output could not be evaluated; refusing to continue \
+             so declared persist volumes/binds aren't silently dropped:\n  {}",
+            nix_error_summary(&e)
+        );
+        exit(1);
     }
     // `net`/`persist` use `or` defaults, so they only fail on a genuinely broken value.
     let net = nix_eval_tup(&flakeref, r#"c: c.net or """#)
@@ -378,17 +389,20 @@ fn nix_eval_tup(flakeref: &str, apply: &str) -> Result<String, String> {
     }
 }
 
-/// Warn that one `outputs.tup` field was ignored because its eval threw — surfacing the nix
-/// error's key line so a typo in the user's `tup` data isn't swallowed silently.
-fn warn_tup(attr: &str, err: &str) {
-    // nix prints a cascade of `error:` lines; the last one with text after the colon is the
-    // concrete cause (e.g. "attribute 'path' missing").
-    let msg = err
-        .lines()
+/// The concrete cause from a nix error cascade: the last `error:` line with text after the
+/// colon (e.g. "attribute 'path' missing"), which is the useful one to show a user.
+fn nix_error_summary(err: &str) -> &str {
+    err.lines()
         .filter_map(|l| l.trim().strip_prefix("error:"))
         .map(str::trim)
         .rfind(|m| !m.is_empty())
-        .unwrap_or("eval failed (see nix output)");
+        .unwrap_or("eval failed (see nix output)")
+}
+
+/// Warn that one `outputs.tup` field was ignored because its eval threw — surfacing the nix
+/// error's key line so a typo in the user's `tup` data isn't swallowed silently.
+fn warn_tup(attr: &str, err: &str) {
+    let msg = nix_error_summary(err);
     eprintln!("[tup] warning: ignoring outputs.tup.{attr} — {msg}");
 }
 

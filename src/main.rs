@@ -6,6 +6,7 @@
 //!
 //!   project   project identity, state dir, name validation
 //!   net       per-project network mode + the pasta DNS relay
+//!   nixenv    hermetic Nix env: eval the project flake → profile → PATH is just that
 //!   sandbox   the backend-neutral container Spec + mount model + backend seam
 //!   bwrap     default backend: render a Spec into a bubblewrap invocation
 //!   pyrex       optional backend (feature "pyrex"): realise a Spec with raw namespace syscalls
@@ -23,6 +24,7 @@ mod pyrex;
 mod init;
 mod migrate;
 mod net;
+mod nixenv;
 mod project;
 mod run;
 mod sandbox;
@@ -91,6 +93,9 @@ COMMANDS:
     --net pasta  (default) dedicated netns, own loopback, NAT egress via pasta
     --net host   share the host network namespace
     --net none   isolated netns, loopback only, no egress
+    --env host   (default) inherit the host /usr + /etc
+    --env nix    hermetic: the project's flake IS the env; drop host /usr, PATH is the
+                 profile's bin. Writes a default flake on first use; needs nix on PATH.
     --harden     drop all capabilities (--cap-drop ALL) + new session (TTY-injection proof).
                  We don't advertise security; this just lowers the escape stakes.
 

@@ -1,6 +1,7 @@
 //! `tup up` — launch a PID-1 supervised container (host side) and shepherd its shutdown.
 
 use crate::net::{net_from_str, write_net, Net};
+use crate::nixenv::{self, env_mode_from_str, EnvMode};
 use crate::project::{ensure_project_root, project_dir};
 use crate::sandbox::{launch, Bind, Spec};
 use std::env;
@@ -86,12 +87,17 @@ pub(crate) fn poll_init_pid(project: &str, tries: u32) -> Option<i32> {
 pub(crate) fn cmd_up(args: &[String]) {
     let mut net = Net::Pasta;
     let mut harden = false;
+    let mut env = EnvMode::Host;
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--net" => {
                 net = net_from_str(args.get(i + 1).map(String::as_str));
+                i += 2;
+            }
+            "--env" => {
+                env = env_mode_from_str(args.get(i + 1).map(String::as_str));
                 i += 2;
             }
             "--harden" => {
@@ -105,7 +111,7 @@ pub(crate) fn cmd_up(args: &[String]) {
         }
     }
     if rest.is_empty() {
-        eprintln!("usage: tup up [--net pasta|host|none] [--harden] <project>");
+        eprintln!("usage: tup up [--net pasta|host|none] [--env host|nix] [--harden] <project>");
         exit(2);
     }
     let project = rest[0].clone();
@@ -134,6 +140,10 @@ pub(crate) fn cmd_up(args: &[String]) {
         .map(OsString::from)
         .collect();
 
+    let profile = match env {
+        EnvMode::Nix => Some(nixenv::realize(&project)),
+        EnvMode::Host => None,
+    };
     let spec = Spec {
         root,
         project: project.clone(),
@@ -141,6 +151,8 @@ pub(crate) fn cmd_up(args: &[String]) {
         chdir: "/work".to_string(),
         harden,
         as_pid1: true,
+        env,
+        profile,
         extra,
         inner,
     };

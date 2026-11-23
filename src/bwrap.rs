@@ -4,7 +4,7 @@
 //! (via `wrap_pasta`) supplies the netns for `Net::Pasta`.
 
 use crate::net::Net;
-use crate::sandbox::{base_ops, env_pairs, wrap_pasta, Op, Spec};
+use crate::sandbox::{base_ops, clears_env, env_pairs, wrap_pasta, Op, Spec};
 use std::ffi::OsString;
 use std::process::Command;
 
@@ -52,6 +52,10 @@ fn render(spec: &Spec) -> Vec<OsString> {
     }
     a.push("--chdir".into());
     a.push(spec.chdir.clone().into());
+    // Hermetic env: wipe the inherited host environment, then set only our own.
+    if clears_env(spec) {
+        a.push("--clearenv".into());
+    }
     for (k, v) in env_pairs(spec) {
         push3(&mut a, "--setenv", k, v);
     }

@@ -17,6 +17,7 @@
 
 use crate::net::{net_from_str, Net};
 use crate::project::project_dir;
+use crate::nixenv::{env_mode_from_str, EnvMode};
 use crate::sandbox::{base_ops, env_pairs, wrap_pasta, Bind, Op, Spec};
 use std::ffi::{CString, OsString};
 use std::fs;
@@ -49,6 +50,12 @@ pub(crate) fn launch(spec: Spec) -> Command {
     a.push(OsString::from(spec.net.label()));
     a.push("--chdir".into());
     a.push(OsString::from(&spec.chdir));
+    a.push("--env".into());
+    a.push(OsString::from(spec.env.label()));
+    if let Some(p) = &spec.profile {
+        a.push("--nix-profile".into());
+        a.push(p.clone().into_os_string());
+    }
     if spec.harden {
         a.push("--harden".into());
     }
@@ -109,6 +116,12 @@ pub(crate) fn run_sandbox(args: &[String]) -> ! {
 
     if let Err(e) = setup_mounts(&ops) {
         die(&format!("mount setup: {e}"));
+    }
+    // Hermetic env: wipe the inherited host environment, then set only our own.
+    if crate::sandbox::clears_env(&spec) {
+        for (k, _) in std::env::vars() {
+            std::env::remove_var(k);
+        }
     }
     for (k, v) in env_pairs(&spec) {
         std::env::set_var(k, v);
@@ -437,6 +450,8 @@ fn parse(args: &[String]) -> Spec {
     let mut chdir = "/work".to_string();
     let mut harden = false;
     let mut as_pid1 = false;
+    let mut env = EnvMode::Host;
+    let mut profile: Option<PathBuf> = None;
     let mut extra: Vec<Bind> = Vec::new();
     let mut inner: Vec<OsString> = Vec::new();
     let mut i = 0;
@@ -456,6 +471,14 @@ fn parse(args: &[String]) -> Spec {
             }
             "--chdir" => {
                 chdir = req(args, i + 1, "--chdir").clone();
+                i += 2;
+            }
+            "--env" => {
+                env = env_mode_from_str(args.get(i + 1).map(String::as_str));
+                i += 2;
+            }
+            "--nix-profile" => {
+                profile = Some(PathBuf::from(req(args, i + 1, "--nix-profile")));
                 i += 2;
             }
             "--harden" => {
@@ -491,6 +514,8 @@ fn parse(args: &[String]) -> Spec {
         chdir,
         harden,
         as_pid1,
+        env,
+        profile,
         extra,
         inner,
     }

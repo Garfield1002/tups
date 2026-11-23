@@ -1,9 +1,11 @@
 //! `tup run` — one-shot command in a project's namespace.
 
 use crate::net::{net_from_str, Net};
+use crate::nixenv::{self, env_mode_from_str, EnvMode};
 use crate::project::ensure_project_root;
 use crate::sandbox::{launch, Bind, Spec};
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::process::exit;
 
 pub(crate) fn cmd_run(args: &[String]) {
@@ -15,6 +17,7 @@ pub(crate) fn cmd_run(args: &[String]) {
     let mut net = Net::Pasta;
     let mut chdir: Option<String> = None;
     let mut harden = false;
+    let mut env = EnvMode::Host;
     let mut extra: Vec<Bind> = Vec::new();
     let mut project: Option<String> = None;
     let mut i = 0;
@@ -22,6 +25,10 @@ pub(crate) fn cmd_run(args: &[String]) {
         match opts[i].as_str() {
             "--net" => {
                 net = net_from_str(opts.get(i + 1).map(String::as_str));
+                i += 2;
+            }
+            "--env" => {
+                env = env_mode_from_str(opts.get(i + 1).map(String::as_str));
                 i += 2;
             }
             "--harden" => {
@@ -65,22 +72,28 @@ pub(crate) fn cmd_run(args: &[String]) {
     let project = match project {
         Some(p) => p,
         None => {
-            eprintln!("usage: tup run [--net M] [--harden] [--bind P] [--ro-bind P] [--chdir P] <project> [-- <cmd>]");
+            eprintln!("usage: tup run [--net M] [--env host|nix] [--harden] [--bind P] [--ro-bind P] [--chdir P] <project> [-- <cmd>]");
             exit(2);
         }
     };
-    let cmd = if cmd.is_empty() {
-        vec!["/bin/bash".to_string()]
-    } else {
-        cmd
-    };
     let root = ensure_project_root(&project);
     let chdir = chdir.unwrap_or_else(|| "/work".to_string());
-    let inner: Vec<OsString> = cmd.iter().map(OsString::from).collect();
+    // Hermetic Nix env: realise the project's flake to a profile store path first (host side,
+    // where nix + network + the store live).
+    let profile: Option<PathBuf> = match env {
+        EnvMode::Nix => Some(nixenv::realize(&project)),
+        EnvMode::Host => None,
+    };
+    let inner: Vec<OsString> = if cmd.is_empty() {
+        nixenv::default_shell(env)
+    } else {
+        cmd.iter().map(OsString::from).collect()
+    };
 
     eprintln!(
-        "[tup] run project={project} net={} chdir={chdir}{}",
+        "[tup] run project={project} net={} env={} chdir={chdir}{}",
         net.label(),
+        env.label(),
         if harden { " [hardened]" } else { "" }
     );
     let spec = Spec {
@@ -90,6 +103,8 @@ pub(crate) fn cmd_run(args: &[String]) {
         chdir,
         harden,
         as_pid1: false,
+        env,
+        profile,
         extra,
         inner,
     };

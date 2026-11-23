@@ -45,6 +45,25 @@ agents author the flake, the user never has to read it. The only thing a flake d
 (links / network / persist) lives as **plain data in a flake output: `outputs.tup = { ... }`**.
 One source of truth, one evaluator (Nix), no second format.
 
+**Implemented — piece 1, hermetic (`src/nixenv.rs`).** `tup run --env nix <project>` (also
+`tup up --env nix`) makes the environment the project's flake, fully hermetic:
+
+- The flake lives at `~/.tup/<project>/env/flake.nix` (a default base prologue — bash,
+  coreutils, cacert, gitMinimal, ripgrep, curl — is written on first use). tup builds its
+  `tupEnv` output (a `buildEnv`) host-side via `nix build`, pinning a `flake.lock`, and
+  resolves the `profile` out-link to a store path.
+- The sandbox then **drops the host `/usr`/`/etc` entirely**. The closure is already in the
+  shared ro `/nix/store` bind, so realising the env copies nothing; it only adds a synthesized
+  `/etc` (passwd/group/resolv.conf) and symlinks the two paths the world hardcodes —
+  `/bin/sh` and `/usr/bin/env` — into the profile. PATH is just `<profile>/bin`; the host env
+  is wiped (`--clearenv` / explicit clear) and replaced with PATH + HOME + SSL_CERT_FILE.
+- Lives behind the `env` field on `Spec`, so **both backends render it** (verified: bwrap and
+  pyrex produce an identical hermetic root — same profile store path, `/usr/bin` holding only
+  `env`, no host leak, `#!/usr/bin/env` shebangs working). Default stays `--env host`.
+
+Still deferred: prologues as composable named profiles, `outputs.tup` plain-data for
+links/net/persist, and `nix copy --to ssh://` as the move transport.
+
 ### Prologues
 
 A **prologue** is a named, reusable, shared Nix profile of tools/libs:
@@ -210,6 +229,8 @@ Everything except the move round-trip is assembling known-good parts. Prove the 
 5. **`tup move` + `tup preflight`** — the between-turn migration round-trip over SSH.
 6. **`tup attach`** — roaming client reattach.
 7. **Nix env integration** — flake eval → store paths → bind-mount; prologues.
+   *(piece 1 done: hermetic `--env nix` — flake → profile → PATH is just the profile, host
+   /usr dropped. Prologues / outputs.tup / nix-copy transport still to come.)*
 
 ## Decision log (what the grilling settled)
 

@@ -17,6 +17,7 @@
 //!   migrate   `tup move` / `tup preflight` — the between-turn migration
 
 use std::env;
+use std::ffi::OsString;
 use std::process::exit;
 
 mod bwrap;
@@ -35,20 +36,35 @@ mod up;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    match args.get(1).map(String::as_str).unwrap_or("help") {
-        "run" => run::cmd_run(&args[2..]),
-        "up" => up::cmd_up(&args[2..]),
-        "env" => nixenv::cmd_env(&args[2..]),
-        "init" => init::cmd_init(&args[2..]),
-        "move" => migrate::cmd_move(&args[2..]),
-        "preflight" => migrate::cmd_preflight(&args[2..]),
-        "ps" => status::cmd_ps(&args[2..]),
-        "attach" => status::cmd_attach(&args[2..]),
-        "stop" => status::cmd_stop(&args[2..]),
-        "rm" => status::cmd_rm(&args[2..]),
-        // Internal: the pyrex backend re-execs the tup binary as the sandbox launcher.
-        "__sandbox" => cmd_sandbox(&args[2..]),
+    // Collect as OsString: env::args() panics on a non-UTF-8 argument, and the pyrex backend
+    // re-execs `tup __sandbox …` carrying paths that must survive verbatim. The String-based
+    // verbs below take a lossy conversion (their inputs — names, flags — are ASCII anyway).
+    let args: Vec<OsString> = env::args_os().collect();
+    let verb = args
+        .get(1)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "help".to_string());
+    // Internal: the pyrex backend re-execs the tup binary as the sandbox launcher. It needs the
+    // original OsStrings, so it is dispatched before the lossy String conversion.
+    if verb == "__sandbox" {
+        cmd_sandbox(&args[2..]);
+    }
+    let rest: Vec<String> = args
+        .iter()
+        .skip(2)
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+    match verb.as_str() {
+        "run" => run::cmd_run(&rest),
+        "up" => up::cmd_up(&rest),
+        "env" => nixenv::cmd_env(&rest),
+        "init" => init::cmd_init(&rest),
+        "move" => migrate::cmd_move(&rest),
+        "preflight" => migrate::cmd_preflight(&rest),
+        "ps" => status::cmd_ps(&rest),
+        "attach" => status::cmd_attach(&rest),
+        "stop" => status::cmd_stop(&rest),
+        "rm" => status::cmd_rm(&rest),
         "version" | "--version" | "-V" => println!("tup {VERSION}"),
         "help" | "--help" | "-h" => print_help(),
         other => {
@@ -60,12 +76,12 @@ fn main() {
 }
 
 #[cfg(feature = "pyrex")]
-fn cmd_sandbox(args: &[String]) -> ! {
+fn cmd_sandbox(args: &[OsString]) -> ! {
     pyrex::run_sandbox(args)
 }
 
 #[cfg(not(feature = "pyrex"))]
-fn cmd_sandbox(_args: &[String]) -> ! {
+fn cmd_sandbox(_args: &[OsString]) -> ! {
     eprintln!("tup: __sandbox requires a build with the 'pyrex' feature");
     exit(2)
 }

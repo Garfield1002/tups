@@ -23,7 +23,7 @@ use std::ffi::{CString, OsString};
 use std::fs;
 use std::fs::File;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
@@ -131,7 +131,7 @@ pub(crate) fn launch(spec: Spec) -> Command {
 // tup __sandbox — the in-container launcher (runs inside pasta's ns for Net::Pasta)
 // ---------------------------------------------------------------------------
 
-pub(crate) fn run_sandbox(args: &[String]) -> ! {
+pub(crate) fn run_sandbox(args: &[OsString]) -> ! {
     let spec = parse(args);
     // base_ops has one host-side side effect (ensure_resolv); run it before we unshare.
     let ops = base_ops(&spec);
@@ -149,12 +149,20 @@ pub(crate) fn run_sandbox(args: &[String]) -> ! {
     //    fork() hands us that PID 1's host-visible pid directly.
     unshare_or_die(libc::CLONE_NEWPID, "pid");
 
+    // Make the new-root dir here, in the parent's (host) mount namespace, with mkdtemp — a
+    // unique, unpredictable name created atomically (no symlink-follow in world-writable /tmp,
+    // and not the always-"1" pid of the child). The monitor removes it after the child exits.
+    let newroot = match make_newroot() {
+        Ok(p) => p,
+        Err(e) => die(&format!("new root: {e}")),
+    };
+
     let child = unsafe { libc::fork() };
     if child < 0 {
         die(&format!("fork: {}", io::Error::last_os_error()));
     }
     if child > 0 {
-        monitor(&spec, child); // never returns
+        monitor(&spec, child, &newroot); // never returns
     }
 
     // ---- child: PID 1 in the new pid namespace ----
@@ -168,7 +176,7 @@ pub(crate) fn run_sandbox(args: &[String]) -> ! {
     }
     unshare_or_die(nsflags, "mount/ipc/uts");
 
-    if let Err(e) = setup_mounts(&ops) {
+    if let Err(e) = setup_mounts(&ops, &newroot) {
         die(&format!("mount setup: {e}"));
     }
     // Hermetic env: wipe the inherited host environment, then set only our own.
@@ -202,7 +210,7 @@ extern "C" fn mon_forward(_sig: libc::c_int) {
     }
 }
 
-fn monitor(spec: &Spec, child: i32) -> ! {
+fn monitor(spec: &Spec, child: i32, newroot: &Path) -> ! {
     // Die with our own parent (tup up, or pasta) so we never linger.
     unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0) };
 
@@ -237,6 +245,9 @@ fn monitor(spec: &Spec, child: i32) -> ! {
         }
     }
     let _ = fs::remove_file(&pidfile);
+    // The child mounted its tmpfs over newroot inside its OWN mount ns, so in the host ns this
+    // is still just the empty dir we mkdtemp'd — remove it so /tmp isn't littered per launch.
+    let _ = fs::remove_dir(newroot);
     let code = if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status)
     } else if libc::WIFSIGNALED(status) {
@@ -251,44 +262,58 @@ fn monitor(spec: &Spec, child: i32) -> ! {
 // mount construction + pivot_root
 // ---------------------------------------------------------------------------
 
-fn setup_mounts(ops: &[Op]) -> io::Result<()> {
+fn setup_mounts(ops: &[Op], newroot: &Path) -> io::Result<()> {
     make_private()?;
-    let newroot = PathBuf::from(format!("/tmp/.tup-root.{}", std::process::id()));
-    fs::create_dir_all(&newroot)?;
-    tmpfs(&newroot)?;
+    tmpfs(newroot)?; // overlay a fresh tmpfs on the (parent-created) new-root dir
 
     for op in ops {
         match op {
             Op::Bind { src, dst, ro } => {
-                let target = under(&newroot, dst);
+                let target = under(newroot, dst);
                 prepare_target(&target, src)?;
                 bind(src, &target, *ro).map_err(|e| annotate(e, dst))?;
             }
             Op::Symlink { target, dst } => {
-                let link = under(&newroot, dst);
+                let link = under(newroot, dst);
                 if let Some(p) = link.parent() {
                     fs::create_dir_all(p)?;
                 }
-                let _ = symlink(target, &link);
+                // Checked: a missing symlink (e.g. /bin/sh in hermetic mode) would otherwise
+                // surface later as an opaque "exec failed" rather than at the real cause.
+                symlink(target, &link).map_err(|e| annotate(e, dst))?;
             }
             Op::Proc(d) => {
-                let t = under(&newroot, d);
+                let t = under(newroot, d);
                 fs::create_dir_all(&t)?;
                 procfs(&t).map_err(|e| annotate(e, d))?;
             }
             Op::Dev(d) => {
-                let t = under(&newroot, d);
+                let t = under(newroot, d);
                 fs::create_dir_all(&t)?;
                 setup_dev(&t)?;
             }
             Op::Tmpfs(d) => {
-                let t = under(&newroot, d);
+                let t = under(newroot, d);
                 fs::create_dir_all(&t)?;
                 tmpfs(&t)?;
             }
         }
     }
-    pivot(&newroot)
+    pivot(newroot)
+}
+
+/// Create a fresh, uniquely-named new-root dir with `mkdtemp`: atomic, mode 0700, and it never
+/// follows a symlink planted at a predictable path (the old `/tmp/.tup-root.<pid>` was always
+/// `.1`, since the child is PID 1 in its new pid ns). Made in the host mount ns so the monitor
+/// can remove the leftover dir on teardown.
+fn make_newroot() -> io::Result<PathBuf> {
+    let mut tmpl = b"/tmp/.tup-root.XXXXXX\0".to_vec();
+    let p = unsafe { libc::mkdtemp(tmpl.as_mut_ptr() as *mut libc::c_char) };
+    if p.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let end = tmpl.iter().position(|&b| b == 0).unwrap_or(tmpl.len());
+    Ok(PathBuf::from(OsString::from_vec(tmpl[..end].to_vec())))
 }
 
 /// Create the mountpoint for a bind: a dir if the source is a dir, else an empty file.
@@ -299,15 +324,18 @@ fn prepare_target(target: &Path, src: &Path) -> io::Result<()> {
         if let Some(p) = target.parent() {
             fs::create_dir_all(p)?;
         }
-        let _ = File::create(target);
+        File::create(target)?; // checked: a missing mountpoint -> opaque bind failure otherwise
     }
     Ok(())
 }
 
-/// /dev: bind the host /dev wholesale. A fresh tmpfs + bound nodes would inherit the
-/// `nodev` flag the kernel forces on new mounts in an unprivileged userns, which makes
-/// char devices (even /dev/null) unusable — so we reuse the host's dev-capable mount.
-/// Cooperative model: no attempt to hide host devices.
+/// /dev: bind the host /dev wholesale, read-WRITE. A fresh tmpfs + bound nodes would inherit
+/// the `nodev` flag the kernel forces on new mounts in an unprivileged userns, which makes
+/// char devices (even /dev/null) unusable — so we reuse the host's dev-capable mount. It is
+/// deliberately rw: the submounts /dev/shm (POSIX shared memory) and /dev/pts (ptys) must be
+/// writable, and a ro bind would (with the recursive-ro fix in `bind`) break both. This is a
+/// known, accepted divergence from bwrap's minimal `--dev`, consistent with the cooperative
+/// model (host device-node permissions still apply; we don't try to hide host devices).
 fn setup_dev(dev: &Path) -> io::Result<()> {
     bind(Path::new("/dev"), dev, false)
 }
@@ -323,8 +351,15 @@ fn pivot(newroot: &Path) -> io::Result<()> {
     }
     std::env::set_current_dir("/")?;
     let oldabs = cstr("/oldroot");
-    unsafe { libc::umount2(oldabs.as_ptr(), libc::MNT_DETACH) };
-    let _ = fs::remove_dir("/oldroot");
+    // Fail CLOSED: if the detach fails we must not launch, or the entire host filesystem stays
+    // mounted read-write at /oldroot inside the container (reported as success).
+    if unsafe { libc::umount2(oldabs.as_ptr(), libc::MNT_DETACH) } != 0 {
+        return Err(io::Error::other(format!(
+            "detach old root: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    let _ = fs::remove_dir("/oldroot"); // best-effort; an empty dir left inside is harmless
     Ok(())
 }
 
@@ -406,20 +441,51 @@ fn bind(src: &Path, target: &Path, ro: bool) -> io::Result<()> {
     mount_call(&s, &t, &none, libc::MS_BIND | libc::MS_REC)
         .map_err(|e| io::Error::new(e.kind(), format!("bind: {e}")))?;
     if ro {
-        // Read-only is a second step: a plain bind can't carry MS_RDONLY. No MS_REC (the
-        // kernel can't recursively remount in one call). Crucially, in an unprivileged
-        // userns the remount must preserve the mount's already-set nosuid/nodev/noexec/
-        // atime flags — dropping a locked flag is EPERM — so re-apply them from statvfs.
-        let keep = locked_flags(target);
-        mount_call(
-            &none,
-            &t,
-            &none,
-            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | keep,
-        )
-        .map_err(|e| io::Error::new(e.kind(), format!("remount-ro: {e}")))?;
+        // Read-only is a second step: a plain bind can't carry MS_RDONLY. The kernel can't
+        // recurse a remount, and the recursive bind above replicated the source's submounts
+        // under `target`, so we remount the top AND each submount ro — otherwise a submount
+        // (e.g. a separate /usr/local) stays writable and pyrex silently diverges from bwrap's
+        // genuinely-recursive --ro-bind.
+        remount_ro(target)?;
+        for sub in submounts_under(target) {
+            remount_ro(&sub)?;
+        }
     }
     Ok(())
+}
+
+/// Remount one already-bound mountpoint read-only. In an unprivileged userns the remount must
+/// preserve the mount's already-set nosuid/nodev/noexec/atime flags — dropping a locked flag
+/// is EPERM — so re-apply them from statvfs.
+fn remount_ro(target: &Path) -> io::Result<()> {
+    let t = cpath(target);
+    let none = cstr("none");
+    let keep = locked_flags(target);
+    mount_call(
+        &none,
+        &t,
+        &none,
+        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | keep,
+    )
+    .map_err(|e| io::Error::new(e.kind(), format!("remount-ro {}: {e}", target.display())))
+}
+
+/// Mountpoints strictly under `target`, from `/proc/self/mountinfo` (field 5 is the mount
+/// point). Used to make a recursive-ro bind actually recursive. (System paths here are ASCII,
+/// so the octal escaping mountinfo uses for exotic bytes isn't decoded.)
+fn submounts_under(target: &Path) -> Vec<PathBuf> {
+    let data = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    let mut out = Vec::new();
+    for line in data.lines() {
+        // fields: mount-id parent-id major:minor root MOUNTPOINT ...
+        if let Some(mp) = line.split(' ').nth(4) {
+            let mpp = PathBuf::from(mp);
+            if mpp != *target && mpp.starts_with(target) {
+                out.push(mpp);
+            }
+        }
+    }
+    out
 }
 
 /// The per-mount flags currently set on `target`, mapped MS_* so a bind-remount can carry
@@ -497,7 +563,7 @@ fn die(msg: &str) -> ! {
 // argv (de)serialization — mirrors `launch` above
 // ---------------------------------------------------------------------------
 
-fn parse(args: &[String]) -> Spec {
+fn parse(args: &[OsString]) -> Spec {
     let mut root = PathBuf::new();
     let mut project = String::new();
     let mut net = Net::None;
@@ -509,42 +575,45 @@ fn parse(args: &[String]) -> Spec {
     let mut extra: Vec<Bind> = Vec::new();
     let mut inner: Vec<OsString> = Vec::new();
     let mut i = 0;
+    // Flag NAMES and the ascii-only values (project/net/chdir/env) match via to_str(); PATHS
+    // (--root, --nix-profile, binds, and the inner command after --) keep full OsString
+    // fidelity, so a non-UTF-8 path survives the __sandbox re-exec instead of being mangled.
     while i < args.len() {
-        match args[i].as_str() {
-            "--root" => {
+        match args[i].to_str() {
+            Some("--root") => {
                 root = PathBuf::from(req(args, i + 1, "--root"));
                 i += 2;
             }
-            "--project" => {
-                project = req(args, i + 1, "--project").clone();
+            Some("--project") => {
+                project = req(args, i + 1, "--project").to_string_lossy().into_owned();
                 i += 2;
             }
-            "--net" => {
-                net = net_from_str(args.get(i + 1).map(String::as_str));
+            Some("--net") => {
+                net = net_from_str(args.get(i + 1).and_then(|s| s.to_str()));
                 i += 2;
             }
-            "--chdir" => {
-                chdir = req(args, i + 1, "--chdir").clone();
+            Some("--chdir") => {
+                chdir = req(args, i + 1, "--chdir").to_string_lossy().into_owned();
                 i += 2;
             }
-            "--env" => {
-                env = env_mode_from_str(args.get(i + 1).map(String::as_str));
+            Some("--env") => {
+                env = env_mode_from_str(args.get(i + 1).and_then(|s| s.to_str()));
                 i += 2;
             }
-            "--nix-profile" => {
+            Some("--nix-profile") => {
                 profile = Some(PathBuf::from(req(args, i + 1, "--nix-profile")));
                 i += 2;
             }
-            "--harden" => {
+            Some("--harden") => {
                 harden = true;
                 i += 1;
             }
-            "--as-pid1" => {
+            Some("--as-pid1") => {
                 as_pid1 = true;
                 i += 1;
             }
-            "--bind" | "--ro-bind" => {
-                let ro = args[i] == "--ro-bind";
+            Some("--bind") | Some("--ro-bind") => {
+                let ro = args[i].to_str() == Some("--ro-bind");
                 let s = req(args, i + 1, "bind src");
                 let d = req(args, i + 2, "bind dst");
                 extra.push(Bind {
@@ -554,11 +623,14 @@ fn parse(args: &[String]) -> Spec {
                 });
                 i += 3;
             }
-            "--" => {
-                inner = args[i + 1..].iter().map(OsString::from).collect();
+            Some("--") => {
+                inner = args[i + 1..].to_vec();
                 break;
             }
-            other => die(&format!("__sandbox: unexpected arg '{other}'")),
+            _ => die(&format!(
+                "__sandbox: unexpected arg '{}'",
+                args[i].to_string_lossy()
+            )),
         }
     }
     Spec {
@@ -575,7 +647,7 @@ fn parse(args: &[String]) -> Spec {
     }
 }
 
-fn req<'a>(args: &'a [String], i: usize, what: &str) -> &'a String {
+fn req<'a>(args: &'a [OsString], i: usize, what: &str) -> &'a OsString {
     args.get(i)
         .unwrap_or_else(|| die(&format!("__sandbox: missing value for {what}")))
 }

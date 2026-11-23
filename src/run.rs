@@ -92,6 +92,7 @@ pub(crate) fn cmd_run(args: &[String]) {
                     net = n;
                 }
             }
+            extra.extend(nixenv::persist_binds(&project, &cfg.persist));
             extra.extend(cfg.binds);
             Some(p)
         }

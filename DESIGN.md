@@ -63,14 +63,23 @@ One source of truth, one evaluator (Nix), no second format.
   tup-owned data the stable `flake.nix` imports), so the flake is generated once and then the
   user's to edit, while `tup env <project> [list|add|rm]` manages the selection without ever
   rewriting the flake. Sharing across projects is automatic via store dedup — no shared flake.
-- *(piece 3 — `outputs.tup`)* The one thing a flake doesn't model — network + host binds
-  ("links") — lives as plain data in the flake's `tup` output (`{ net; binds; }`). tup reads it
-  with `nix eval --apply` (no JSON dependency) and applies it: `net` sets the default network
-  mode (an explicit `--net` still wins) and `binds` become sandbox binds. Verified: a flake
-  declaring `net = "none"` + a host bind is honoured by `tup run` with no CLI flags.
-
-Still deferred: `outputs.tup.persist` (volumes — its own slice) and `nix copy --to ssh://` as
-the `tup move` closure transport.
+- *(piece 3 — `outputs.tup`)* The things a flake doesn't model — network, persist volumes, and
+  host binds ("links") — live as plain data in the flake's `tup` output (`{ net; persist;
+  binds; }`). tup reads it with `nix eval --apply` (no JSON dependency) and applies it: `net`
+  sets the default network mode (an explicit `--net` still wins) and `binds` become sandbox
+  binds. Verified: a flake declaring `net = "none"` + a host bind is honoured by `tup run` with
+  no CLI flags.
+- *(piece 4 — persist + move transport)* `outputs.tup.persist` lists rw dirs that survive turns
+  and ride the move payload; each is backed by `~/.tup/<project>/persist/<slug>` and bound rw.
+  `tup move` now ships the flake (so the target realises the same env) and `nix copy --to
+  ssh://<dest>` the built closure by hash (dedup; only missing paths transfer; a failure falls
+  back to a target-side rebuild). Persist dirs rsync alongside the working tree, and the target
+  resumes with `--env nix`. Because the supervisor (`tup`) is a glibc binary that must run as
+  PID 1 *inside* the hermetic root, `tup up --env nix` binds tup's own loader (at its ELF-interp
+  path) + libc/libgcc (into `/usr/lib`, a default search dir) — the only host files in an
+  otherwise hermetic root, and only for the supervisor, never on a plain `tup run`. Verified:
+  persist survives a local move + resume on both backends; `nix copy` ships the closure (the
+  `ssh://` hop itself needs a second host, untestable here).
 
 ### Prologues
 
@@ -234,12 +243,13 @@ Everything except the move round-trip is assembling known-good parts. Prove the 
 2. **`tup init` as PID 1** — supervisor, declared services, clean quiesce/reap.
 3. **Network** — `pasta` wiring: own netns, loopback, NAT egress.
 4. **Persist volumes + working-tree model** — the move payload boundary.
+   *(persist volumes done via `outputs.tup.persist` — see slice 7 piece 4.)*
 5. **`tup move` + `tup preflight`** — the between-turn migration round-trip over SSH.
 6. **`tup attach`** — roaming client reattach.
 7. **Nix env integration** — flake eval → store paths → bind-mount; prologues.
-   *(pieces 1–3 done: hermetic `--env nix` — flake → profile → PATH is just the profile, host
-   /usr dropped; prologues (base + opt-in languages, `tup env`); `outputs.tup` net + binds.
-   Remaining: `outputs.tup.persist` volumes and `nix copy` move transport.)*
+   *(pieces 1–4 done: hermetic `--env nix` — flake → profile → PATH is just the profile, host
+   /usr dropped; prologues (base + opt-in languages, `tup env`); `outputs.tup` net/persist/binds;
+   `tup move` ships the flake + `nix copy`s the closure by hash and restores persist volumes.)*
 
 ## Decision log (what the grilling settled)
 

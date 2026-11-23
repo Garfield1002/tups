@@ -107,9 +107,12 @@ const FLAKE: &str = r#"{
         name = "tup-env";
         paths = (pkgs.lib.concatMap (n: prologues.${n}) active) ++ extraPackages;
       };
-      # Plain data tup reads via `nix eval`: network mode + host binds ("links").
+      # Plain data tup reads via `nix eval`: network, persist volumes, host binds ("links").
       tup = {
         net = "pasta";
+        persist = [
+          # "/state"   # rw dirs that survive turns and ride the move payload
+        ];
         binds = [
           # { host = "/abs/host/path"; path = "/abs/container/path"; ro = true; }
         ];
@@ -279,6 +282,7 @@ pub(crate) fn ensure_etc(project: &str) {
 /// What the flake's `tup` output declares. Empty when the flake has no such output.
 pub(crate) struct TupConfig {
     pub net: Option<Net>,
+    pub persist: Vec<PathBuf>,
     pub binds: Vec<Bind>,
 }
 
@@ -292,6 +296,15 @@ pub(crate) fn read_tup_config(project: &str) -> TupConfig {
         "none" => Some(Net::None),
         _ => None,
     });
+    // Persist volumes: one container path per line.
+    let persist = nix_eval_tup(&flakeref, r#"c: builtins.concatStringsSep "\n" (c.persist or [])"#)
+        .map(|s| {
+            s.lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default();
     // One tab-separated line per bind: "<ro|rw>\t<host>\t<path>".
     let apply = r#"c: builtins.concatStringsSep "\n" (map (b: "${if (b.ro or true) then "ro" else "rw"}\t${b.host}\t${b.path}") (c.binds or []))"#;
     let mut binds = Vec::new();
@@ -307,7 +320,11 @@ pub(crate) fn read_tup_config(project: &str) -> TupConfig {
             }
         }
     }
-    TupConfig { net, binds }
+    TupConfig {
+        net,
+        persist,
+        binds,
+    }
 }
 
 fn nix_eval_tup(flakeref: &str, apply: &str) -> Option<String> {
@@ -328,6 +345,63 @@ fn nix_eval_tup(flakeref: &str, apply: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// Piece 4: persist volumes + move transport.
+// ---------------------------------------------------------------------------
+
+/// `~/.tup/<project>/persist/` — the host backing for the project's persist volumes. These are
+/// part of the move payload (rsync'd alongside the working tree).
+pub(crate) fn persist_dir(project: &str) -> PathBuf {
+    project_dir(project).join("persist")
+}
+
+/// Map a container persist path to a filesystem-safe backing slug (`/var/lib/x` -> `var_lib_x`).
+fn persist_slug(p: &Path) -> String {
+    let s: String = p
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let t = s.trim_matches('_').to_string();
+    if t.is_empty() {
+        "root".to_string()
+    } else {
+        t
+    }
+}
+
+/// Back each declared persist volume with a host dir under `persist/` and bind it rw at its
+/// container path. The dirs survive container teardown and ride the move payload.
+pub(crate) fn persist_binds(project: &str, paths: &[PathBuf]) -> Vec<Bind> {
+    let base = persist_dir(project);
+    let mut out = Vec::new();
+    for p in paths {
+        let host = base.join(persist_slug(p));
+        if let Err(e) = std::fs::create_dir_all(&host) {
+            eprintln!("tup: create persist {}: {e}", host.display());
+            exit(1);
+        }
+        out.push(Bind {
+            src: host,
+            dst: p.clone(),
+            ro: false,
+        });
+    }
+    out
+}
+
+/// Whether a project uses the hermetic Nix env (has a flake). Used by `tup move` to decide
+/// whether to ship the flake + copy the closure and bring the target up with `--env nix`.
+pub(crate) fn is_nix_project(project: &str) -> bool {
+    env_dir(project).join("flake.nix").exists()
+}
+
+/// The realised profile store path (the `profile` out-link target), if the env has been built.
+/// This is the closure root `tup move` ships by hash via `nix copy`.
+pub(crate) fn profile_path(project: &str) -> Option<PathBuf> {
+    std::fs::canonicalize(env_dir(project).join("profile")).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +443,10 @@ fn show(project: &str) {
     let cfg = read_tup_config(project);
     if let Some(n) = cfg.net {
         println!("  tup.net:   {}", n.label());
+    }
+    if !cfg.persist.is_empty() {
+        let ps: Vec<String> = cfg.persist.iter().map(|p| p.display().to_string()).collect();
+        println!("  tup.persist: {}", ps.join(" "));
     }
     if !cfg.binds.is_empty() {
         println!("  tup.binds:");

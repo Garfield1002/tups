@@ -129,7 +129,8 @@ pub(crate) fn cmd_up(args: &[String]) {
                     net = n;
                 }
             }
-            tup_binds = cfg.binds;
+            tup_binds = nixenv::persist_binds(&project, &cfg.persist);
+            tup_binds.extend(cfg.binds);
             Some(p)
         }
         EnvMode::Host => None,

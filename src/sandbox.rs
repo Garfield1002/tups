@@ -155,6 +155,100 @@ fn nix_system_layer(v: &mut Vec<Op>, spec: &Spec) {
         target: profile.join("bin/env"),
         dst: "/usr/bin/env".into(),
     });
+    // The one host binary that must run *inside* the hermetic root is tup itself, as the
+    // `tup up` PID-1 supervisor (bound at /run/tup). It's a glibc binary, so bind its own
+    // loader + libs — the loader at its absolute ELF-interp path, the libraries into /usr/lib
+    // (a default search dir, so no ld.so.cache or LD_LIBRARY_PATH is needed, and the agent's
+    // profile binaries — which resolve their libc via /nix/store RUNPATHs — never look here).
+    if spec.as_pid1 {
+        // The kernel opens the loader at the exe's ELF-interp path (often a symlink like
+        // /lib64/ld-linux-…), which differs from the resolved real path /proc/self/maps shows.
+        let interp = std::env::current_exe().ok().and_then(|e| elf_interp(&e));
+        for lib in self_libs() {
+            let name = match lib.file_name() {
+                Some(n) => n.to_owned(),
+                None => continue,
+            };
+            // Libraries go in /usr/lib (a default loader search dir).
+            v.push(Op::Bind {
+                src: lib.clone(),
+                dst: PathBuf::from("/usr/lib").join(&name),
+                ro: true,
+            });
+            // The loader additionally at the exact interp path the kernel will open.
+            if is_loader(&name) {
+                if let Some(ip) = &interp {
+                    v.push(Op::Bind {
+                        src: lib,
+                        dst: PathBuf::from(ip),
+                        ro: true,
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn is_loader(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().starts_with("ld-")
+}
+
+/// Read the program interpreter (PT_INTERP) path out of an ELF64 little-endian binary — the
+/// path the kernel opens to run it, which may be a symlink distinct from the real loader file.
+fn elf_interp(exe: &Path) -> Option<String> {
+    let d = std::fs::read(exe).ok()?;
+    if d.len() < 64 || &d[0..4] != b"\x7fELF" || d[4] != 2 {
+        return None; // not ELF64
+    }
+    let u64le = |o: usize| -> Option<usize> { Some(u64::from_le_bytes(d.get(o..o + 8)?.try_into().ok()?) as usize) };
+    let u16le = |o: usize| -> Option<usize> { Some(u16::from_le_bytes(d.get(o..o + 2)?.try_into().ok()?) as usize) };
+    let phoff = u64le(32)?;
+    let phentsize = u16le(54)?;
+    let phnum = u16le(56)?;
+    for i in 0..phnum {
+        let off = phoff + i * phentsize;
+        let p_type = u32::from_le_bytes(d.get(off..off + 4)?.try_into().ok()?);
+        if p_type == 3 {
+            // PT_INTERP: p_offset @ off+8, p_filesz @ off+32
+            let p_offset = u64le(off + 8)?;
+            let p_filesz = u64le(off + 32)?;
+            let end = (p_offset + p_filesz).min(d.len());
+            let bytes = d.get(p_offset..end)?;
+            let s = bytes.split(|b| *b == 0).next()?;
+            return Some(String::from_utf8_lossy(s).into_owned());
+        }
+    }
+    None
+}
+
+/// The shared objects this tup process has mapped (its loader + libc + libgcc), read from
+/// `/proc/self/maps`. Used to make the `tup` PID-1 supervisor runnable inside a hermetic root.
+/// Store paths are skipped (already visible via the `/nix` bind) and so is the exe itself
+/// (bound separately at `/run/tup`).
+fn self_libs() -> Vec<PathBuf> {
+    let me = std::env::current_exe().ok();
+    let mut out: Vec<PathBuf> = Vec::new();
+    let maps = match std::fs::read_to_string("/proc/self/maps") {
+        Ok(m) => m,
+        Err(_) => return out,
+    };
+    for line in maps.lines() {
+        let path = match line.find(" /") {
+            Some(i) => line[i + 1..].trim(),
+            None => continue,
+        };
+        if !path.starts_with('/') || path.starts_with("/nix/") || path.ends_with("(deleted)") {
+            continue;
+        }
+        let p = PathBuf::from(path);
+        if Some(&p) == me.as_ref() || out.contains(&p) {
+            continue;
+        }
+        if p.is_file() {
+            out.push(p);
+        }
+    }
+    out
 }
 
 /// Environment variables every container gets. In hermetic Nix mode this also establishes the

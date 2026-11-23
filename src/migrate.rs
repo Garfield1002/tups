@@ -2,6 +2,7 @@
 //! rw root (+ services + net) over rsync/ssh, and bring it up on the target.
 
 use crate::net::read_net_label;
+use crate::nixenv;
 use crate::project::project_dir;
 use crate::up::{find_init_pid, poll_init_pid};
 use std::env;
@@ -71,7 +72,34 @@ fn preflight_report(project: &str) {
         human(bytes),
         root.display()
     );
-    eprintln!("  host-pins : none (link feature not yet implemented)");
+    // Nix env: the closure ships by hash (nix copy / cache), not as raw bytes.
+    if nixenv::is_nix_project(project) {
+        match nixenv::profile_path(project) {
+            Some(p) => eprintln!("  env       : nix — closure ships by hash: {}", p.display()),
+            None => eprintln!("  env       : nix — not yet built; target rebuilds from the flake"),
+        }
+    } else {
+        eprintln!("  env       : host /usr (inherited on the target, not shipped)");
+    }
+    // Persist volumes ride the payload as mutable bytes.
+    let persist = project_dir(project).join("persist");
+    if persist.exists() {
+        let pb = dir_size(&persist);
+        eprintln!("  persist   : {} ({pb} bytes)  {}", human(pb), persist.display());
+    }
+    // Host binds declared in the flake pin the project to paths that must exist on the target.
+    let cfg = nixenv::read_tup_config(project);
+    if cfg.binds.is_empty() {
+        eprintln!("  host-pins : none");
+    } else {
+        eprintln!(
+            "  host-pins : {} bind(s) — won't move unless the target has these paths:",
+            cfg.binds.len()
+        );
+        for b in &cfg.binds {
+            eprintln!("              {} {}", if b.ro { "ro" } else { "rw" }, b.src.display());
+        }
+    }
     eprintln!("  note      : undeclared processes are reported by the source's quiesce");
 }
 
@@ -136,6 +164,78 @@ fn run_rsync(args: &[&str]) {
     }
 }
 
+/// Extra `tup up` args so the target resumes with the same env mode as the source.
+fn env_up_args(project: &str) -> Vec<String> {
+    if nixenv::is_nix_project(project) {
+        vec!["--env".to_string(), "nix".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// rsync a sibling payload dir (`persist`, `env`) into another local project dir, if present.
+fn ship_dir_local(src_dir: &Path, dst_dir: &Path, name: &str, excludes: &[&str]) {
+    let src = src_dir.join(name);
+    if !src.exists() {
+        return;
+    }
+    let _ = fs::create_dir_all(dst_dir.join(name));
+    let s = format!("{}/", src.display());
+    let d = format!("{}/", dst_dir.join(name).display());
+    let mut args: Vec<String> = vec!["-a".into(), "--delete".into()];
+    for e in excludes {
+        args.push("--exclude".into());
+        args.push((*e).to_string());
+    }
+    args.push(s);
+    args.push(d);
+    run_rsync(&args.iter().map(String::as_str).collect::<Vec<_>>());
+}
+
+/// rsync a sibling payload dir to a remote `~/.tup/<project>/<name>`, if present.
+fn ship_dir_remote(dest: &str, project: &str, src_dir: &Path, name: &str, excludes: &[&str]) {
+    let src = src_dir.join(name);
+    if !src.exists() {
+        return;
+    }
+    ssh(dest, &format!("mkdir -p .tup/{project}/{name}"));
+    let s = format!("{}/", src.display());
+    let d = format!("{dest}:.tup/{project}/{name}/");
+    let mut args: Vec<String> = vec!["-a".into(), "--delete".into(), "-e".into(), "ssh".into()];
+    for e in excludes {
+        args.push("--exclude".into());
+        args.push((*e).to_string());
+    }
+    args.push(s);
+    args.push(d);
+    run_rsync(&args.iter().map(String::as_str).collect::<Vec<_>>());
+}
+
+/// Push the env closure to the target's store by hash — only paths it lacks transfer. The
+/// move stays correct without it (the target rebuilds from the flake + its own cache), so a
+/// failure is a warning, not a hard error.
+fn nix_copy(dest: &str, profile: &Path) {
+    eprintln!("[tup] nix copy env closure -> {dest} (by hash; only missing paths transfer)");
+    let to = format!("ssh://{dest}");
+    let r = Command::new("nix")
+        .args([
+            "copy",
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "--to",
+            &to,
+        ])
+        .arg(profile)
+        .status();
+    match r {
+        Ok(s) if s.success() => {}
+        Ok(s) => eprintln!("[tup] warning: nix copy failed ({s}); target will rebuild from its cache"),
+        Err(e) => {
+            eprintln!("[tup] warning: nix unavailable for copy ({e}); target will rebuild from its cache")
+        }
+    }
+}
+
 pub(crate) fn cmd_move(args: &[String]) {
     if args.len() < 2 {
         eprintln!("usage: tup move <project> <local:<newproject> | [user@]host>");
@@ -188,6 +288,11 @@ fn local_move(project: &str, newproj: &str) {
     let d = format!("{}/", dst_root.display());
     run_rsync(&["-a", "--delete", &s, &d]);
 
+    // Persist volumes ride the payload; the env flake ships so the target realises the same
+    // env by hash (on one machine the closure is already in the shared store).
+    ship_dir_local(&src_dir, &dst_dir, "persist", &[]);
+    ship_dir_local(&src_dir, &dst_dir, "env", &["profile", "etc"]);
+
     let src_svc = src_dir.join("services");
     if src_svc.exists() {
         if let Err(e) = fs::copy(&src_svc, dst_dir.join("services")) {
@@ -199,19 +304,15 @@ fn local_move(project: &str, newproj: &str) {
     let _ = fs::copy(src_dir.join("net"), dst_dir.join("net"));
     eprintln!("[tup] shipped root: {project} -> {newproj} (net={net})");
 
-    // Bring the project up on the "target" with the SAME net mode, and confirm it resumed.
+    // Bring the project up on the "target" with the SAME net + env mode, and confirm it resumed.
     let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("tup"));
     let log = dst_dir.join("up.log");
-    spawn_detached(
-        &exe,
-        &[
-            "up".to_string(),
-            "--net".to_string(),
-            net,
-            newproj.to_string(),
-        ],
-        &log,
-    );
+    let mut up_args = vec!["up".to_string()];
+    up_args.extend(env_up_args(newproj));
+    up_args.push("--net".to_string());
+    up_args.push(net.clone());
+    up_args.push(newproj.to_string());
+    spawn_detached(&exe, &up_args, &log);
     match poll_init_pid(newproj, 150) {
         Some(p) => eprintln!(
             "[tup] resumed as '{newproj}' (init pid {p}); log {}",
@@ -247,6 +348,17 @@ fn remote_move(project: &str, dest: &str) {
     ssh(dest, &format!("mkdir -p .tup/{project}/root"));
     run_rsync(&["-a", "--delete", "-e", "ssh", &s, &remote_root]);
 
+    // Env: ship the flake (so the target realises the same env), and push the built closure by
+    // hash via `nix copy` so the target need not rebuild or reach the public cache.
+    ship_dir_remote(dest, project, &src_dir, "env", &["profile", "etc"]);
+    if nixenv::is_nix_project(project) {
+        if let Some(profile) = nixenv::profile_path(project) {
+            nix_copy(dest, &profile);
+        }
+    }
+    // Persist volumes ride the payload.
+    ship_dir_remote(dest, project, &src_dir, "persist", &[]);
+
     let src_svc = src_dir.join("services");
     if src_svc.exists() {
         if let Some(svc) = src_svc.to_str() {
@@ -268,8 +380,13 @@ fn remote_move(project: &str, dest: &str) {
     }
     eprintln!("[tup] shipped root: {project} -> {dest} (net={net})");
 
+    let envflag = if nixenv::is_nix_project(project) {
+        "--env nix "
+    } else {
+        ""
+    };
     let up = format!(
-        "setsid nohup tup up --net {net} {project} > .tup/{project}/up.log 2>&1 < /dev/null &"
+        "setsid nohup tup up {envflag}--net {net} {project} > .tup/{project}/up.log 2>&1 < /dev/null &"
     );
     ssh(dest, &up);
     eprintln!("[tup] requested start on {dest}; confirm with: ssh {dest} tup preflight {project}");

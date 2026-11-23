@@ -1,4 +1,4 @@
-# tup — ultra-micro containers for coding agents
+# tups — ultra-micro containers for coding agents
 
 > Contain the blast radius of a coding agent, and move its session between servers —
 > while sharing binaries and libraries across all projects.

@@ -1,6 +1,6 @@
-# tup — ultra-micro containers for coding agents
+# tups — ultra-micro containers for coding agents
 
-`tup` ("tupperware") puts a coding agent's project in its own filesystem, network, and
+**tups** (command: `tup`) puts a coding agent's project in its own filesystem, network, and
 process namespaces, then lets you **move the whole live session to another server** between
 turns. The goal is two things:
 

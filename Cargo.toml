@@ -1,8 +1,8 @@
 [package]
-name = "tupperware"
+name = "tups"
 version = "0.0.1"
 edition = "2021"
-description = "tupperware: small, weak, movable containers for coding agents — contain the blast radius, move the session."
+description = "tups: small, weak, movable containers for coding agents — contain the blast radius, move the session."
 
 [[bin]]
 name = "tup"

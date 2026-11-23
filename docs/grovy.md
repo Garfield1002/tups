@@ -1,4 +1,4 @@
-# Running grovy sessions inside tupperware
+# Running grovy sessions inside tups
 
 grovy launches each Claude session in its own tmux session as:
 
@@ -26,15 +26,15 @@ The wrapper binds, at their real paths: the project tree (rw), `~/.claude` (rw),
 `GROVY_CLAUDE` affects **all new sessions** while it is set; sessions already running
 are untouched. To try it:
 
-1. Build tup:  `cd tupperware && cargo build --release`  (binary at `target/release/tup`).
+1. Build tup:  `cd tups && cargo build --release`  (binary at `target/release/tup`).
 2. Put `tup` on grovyd's PATH, or pass `TUP_BIN=/abs/path/to/tup` in the env below.
 3. Set the override in grovyd's environment and restart it. For the systemd user service:
 
        systemctl --user edit grovy
        # add:
        [Service]
-       Environment=GROVY_CLAUDE=/abs/path/to/tupperware/tools/tup-claude
-       Environment=TUP_BIN=/abs/path/to/tupperware/target/release/tup
+       Environment=GROVY_CLAUDE=/abs/path/to/tups/tools/tup-claude
+       Environment=TUP_BIN=/abs/path/to/tups/target/release/tup
 
        systemctl --user restart grovy      # running sessions keep going
 

@@ -109,7 +109,7 @@ const FLAKE: &str = r#"{
         paths = (pkgs.lib.concatMap (n: prologues.${n}) active) ++ extraPackages;
       };
       # Plain data tup reads via `nix eval`: network, persist volumes, host binds ("links"),
-      # and brokered credential agents.
+      # brokered credential agents, gates, port forwards, and the move dial.
       tup = {
         net = "pasta";
         persist = [
@@ -118,6 +118,11 @@ const FLAKE: &str = r#"{
         binds = [
           # { host = "/abs/host/path"; path = "/abs/container/path"; ro = true; }
         ];
+        # Port forwards (pasta only): expose a container port on a host port. Equivalent to
+        # `--port` on the CLI. `host`/`container` are ports; `proto` is "tcp" (default) or "udp".
+        ports = [
+          # { proto = "tcp"; host = 8080; container = 3000; }
+        ];
         # Credential agents forwarded into the container: tup binds a SOCKET to a host agent
         # that holds the secret and brokers it — the key never enters the container. Each
         # entry here is an explicit grant (deny-by-default: nothing forwarded unless named).
@@ -125,11 +130,21 @@ const FLAKE: &str = r#"{
           # ssh.key = "tups-deploy";   # git/ssh auth via an ssh-agent holding only this key
         };
         # Gates: a filtered escape hatch. The container holds only a socket; the HOST performs
-        # the operation and enforces this policy (deny-by-default), using its own credentials —
-        # nothing enters the container. The container drives it with `tup push` / `tup fetch`.
+        # the operation and enforces the policy (deny-by-default), with the host's credentials —
+        # nothing enters the container. The container drives a gate with `tup gate <name> …`
+        # (and the built-in git gate also with `tup push` / `tup fetch`).
         gates = {
+          # Built-in git gate (kind defaults to "git" for the name "git"):
           # git = { remote = "git@github.com:you/repo.git"; allow = [ "push" "fetch" ]; };
           #                                                 # refs = [ "refs/heads/main" ];  (optional)
+          # A user-defined command gate: the host runs `run` with ONE allowed arg, in `tree`.
+          # deploy = { kind = "command"; run = "/abs/host/deploy.sh"; allow = [ "staging" "prod" ]; };
+        };
+        # Move dial: what rides the rsync payload vs. what the target rebuilds/refetches.
+        # Defaults infer derived/cache dirs (target/, node_modules/, .venv/, …) as rebuild.
+        move = {
+          # ship    = [ "/work/important-generated" ];  # force these INTO the payload
+          # rebuild = [ "/work/node_modules" ];         # force these OUT (target rebuilds)
         };
       };
     };

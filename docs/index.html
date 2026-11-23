@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tups — ultra-micro containers for coding agents</title>
+<meta name="description" content="tups gives a coding agent its own filesystem, network, and process namespaces — and lets you move the live session to another machine between turns.">
+<style>
+  :root {
+    --bg: #0c1117;
+    --panel: #11171f;
+    --panel-2: #0a0e14;
+    --border: #202837;
+    --text: #d7dee8;
+    --muted: #8793a4;
+    --heading: #f2f6fc;
+    --accent: #4ee39a;
+    --accent-dim: #2fae74;
+    --code: #e6edf3;
+    --shadow: 0 1px 0 rgba(255,255,255,.02), 0 18px 40px -24px rgba(0,0,0,.8);
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #fbfcfe;
+      --panel: #ffffff;
+      --panel-2: #f4f7fb;
+      --border: #e2e8f1;
+      --text: #37404d;
+      --muted: #697689;
+      --heading: #10151c;
+      --accent: #119a5f;
+      --accent-dim: #0c7a4a;
+      --code: #1b2430;
+      --shadow: 0 1px 0 rgba(0,0,0,.02), 0 18px 40px -28px rgba(20,40,60,.35);
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 0 16px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, pre, .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
+
+  header { padding: 72px 0 36px; }
+  .eyebrow {
+    font-size: 13px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--accent-dim); font-weight: 600; margin: 0 0 14px;
+  }
+  h1 {
+    font-size: clamp(44px, 10vw, 76px); line-height: .98; margin: 0 0 18px;
+    color: var(--heading); letter-spacing: -.03em; font-weight: 800;
+  }
+  h1 .mono { color: var(--accent); }
+  .lede { font-size: clamp(18px, 3.4vw, 22px); color: var(--muted); margin: 0 0 30px; max-width: 42ch; }
+  .lede strong { color: var(--text); font-weight: 600; }
+
+  pre.term {
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px;
+    padding: 18px 18px; margin: 0; overflow-x: auto; font-size: 14px; line-height: 1.9;
+    color: var(--code); box-shadow: var(--shadow);
+  }
+  pre.term .c { color: var(--muted); }
+  pre.term .p { color: var(--accent); }
+
+  section { padding: 44px 0; border-top: 1px solid var(--border); }
+  h2 {
+    font-size: 13px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--muted); font-weight: 600; margin: 0 0 24px;
+  }
+  h3 { color: var(--heading); font-size: 19px; margin: 0 0 6px; letter-spacing: -.01em; }
+  p { margin: 0 0 14px; }
+  p.m { color: var(--muted); }
+
+  .cards { display: grid; grid-template-columns: 1fr; gap: 14px; }
+  @media (min-width: 640px) { .cards { grid-template-columns: repeat(3, 1fr); } }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px; box-shadow: var(--shadow);
+  }
+  .card .ic { color: var(--accent); font-size: 20px; margin-bottom: 10px; }
+  .card p { margin: 0; color: var(--muted); font-size: 15px; }
+
+  .table-scroll { overflow-x: auto; margin: 4px 0 0; }
+  table { border-collapse: collapse; width: 100%; font-size: 14.5px; min-width: 520px; }
+  th, td { text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  thead th { color: var(--muted); font-weight: 600; font-size: 12px; letter-spacing: .04em; text-transform: uppercase; }
+  tbody th { color: var(--text); font-weight: 600; white-space: nowrap; }
+  td.tup { color: var(--text); }
+  td.tup strong { color: var(--accent); font-weight: 600; }
+  td.old { color: var(--muted); }
+
+  .split { display: grid; grid-template-columns: 1fr; gap: 20px; }
+  @media (min-width: 640px) { .split { grid-template-columns: 1fr 1fr; } }
+  .block {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 22px;
+    box-shadow: var(--shadow);
+  }
+  .block h3 .tag {
+    font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent);
+    border: 1px solid var(--accent-dim); border-radius: 999px; padding: 2px 8px; margin-left: 8px;
+    vertical-align: middle; font-weight: 600;
+  }
+  .block p { font-size: 15px; color: var(--muted); margin: 10px 0 0; }
+  .block code { color: var(--code); background: var(--panel-2); padding: 1px 6px; border-radius: 5px; font-size: 13px; }
+
+  .note {
+    border-left: 3px solid var(--accent-dim); padding: 4px 0 4px 16px; margin: 24px 0 0;
+    color: var(--muted); font-size: 15px;
+  }
+  .note strong { color: var(--text); }
+
+  pre.code {
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px;
+    padding: 18px; overflow-x: auto; font-size: 13.5px; line-height: 1.7; color: var(--code);
+    margin: 0; box-shadow: var(--shadow);
+  }
+  pre.code .c { color: var(--muted); }
+  pre.code .k { color: var(--accent); }
+
+  footer { padding: 48px 0 72px; border-top: 1px solid var(--border); color: var(--muted); font-size: 14px; }
+  .btn {
+    display: inline-block; background: var(--accent); color: #05120b; font-weight: 700;
+    padding: 10px 20px; border-radius: 9px; margin: 6px 0 20px;
+  }
+  .btn:hover { text-decoration: none; background: var(--accent-dim); }
+  .lst { color: var(--muted); font-size: 14px; }
+  .lst code { color: var(--text); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <p class="eyebrow">Rootless · no daemon · ~10&nbsp;ms start</p>
+    <h1><span class="mono">tups</span></h1>
+    <p class="lede"><strong>Ultra-micro containers for coding agents.</strong> Give an agent
+      its own filesystem, network, and process namespaces — then move the live session to
+      another machine between turns.</p>
+    <pre class="term"><span class="c"># one-shot, in a private namespace</span>
+<span class="p">tup</span> run web -- cargo test
+<span class="c"># long-lived, supervised, PID 1</span>
+<span class="p">tup</span> up  web
+<span class="c"># ship the whole session elsewhere, resume it there</span>
+<span class="p">tup</span> move web user@host</pre>
+  </header>
+
+  <section>
+    <h2>What it does</h2>
+    <div class="cards">
+      <div class="card">
+        <div class="ic">▣</div>
+        <h3>Contains the blast radius</h3>
+        <p>A mistake stays inside the project — its files, its ports, its process tree —
+          instead of reaching the rest of your machine.</p>
+      </div>
+      <div class="card">
+        <div class="ic">⇄</div>
+        <h3>Relocates a session</h3>
+        <p>Pause an agent on one box, ship it to another, resume it there — with the same
+          internal addresses on every server.</p>
+      </div>
+      <div class="card">
+        <div class="ic">⚿</div>
+        <h3>Lends capabilities</h3>
+        <p>The container can <span class="mono">git&nbsp;push</span> without holding a key —
+          the host performs the filtered operation on its behalf.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Why this way</h2>
+    <p>Most isolation tools build an <em>image</em> and run it under a <em>daemon</em> as
+      <em>root</em>. That buys strong multi-tenant security, and it costs a build step, a copy
+      of your files, a background service, and seconds of startup.</p>
+    <p class="m">A coding agent doesn't need any of that. It needs its own blast radius and a
+      fast loop. So a <span class="mono">tup</span> container is just <strong>namespaces laid
+      over your real working tree</strong> — no image, no daemon, no <span class="mono">sudo</span>.
+      Binaries live once in a shared read-only <span class="mono">/nix/store</span>, so a
+      container starts in ~10&nbsp;ms and the agent edits <em>your</em> files directly. Nothing
+      to sync, nothing to rebuild.</p>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th></th><th>Typical container</th><th>tup</th></tr></thead>
+        <tbody>
+          <tr><th>Needs</th><td class="old">image build, daemon, root</td><td class="tup"><strong>user namespaces, nothing else</strong></td></tr>
+          <tr><th>The agent's files</th><td class="old">a copy inside the image</td><td class="tup"><strong>your real working tree, bind-mounted</strong></td></tr>
+          <tr><th>Startup</th><td class="old">seconds</td><td class="tup"><strong>~10 ms</strong></td></tr>
+          <tr><th>Move a running session</th><td class="old">checkpoint tooling, if at all</td><td class="tup"><strong>tup move, addresses preserved</strong></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Using credentials without holding them</h2>
+    <p class="m">A container often needs to <em>use</em> a secret — <span class="mono">git push</span>
+      over ssh — but should never be able to <em>read</em> it. Both grants are
+      deny-by-default: with nothing declared, the container reaches no host credentials at all.</p>
+    <div class="split">
+      <div class="block">
+        <h3>Gates <span class="tag">preferred</span></h3>
+        <p>The container holds only a socket. The <strong>host</strong> is the reference
+          monitor — it reads the policy, filters the request, and runs the operation itself.
+          <code>tup push main</code> inside the box becomes a host-side <code>git push</code> to
+          the one remote the policy names. It can do <em>only</em> the declared operation; no
+          key or token ever enters the container.</p>
+      </div>
+      <div class="block">
+        <h3>Agents</h3>
+        <p>Forward a <em>socket</em> to a host <code>ssh-agent</code>, not the key.
+          <code>git</code> inside the container signs GitHub's challenge over the socket; the
+          private key never crosses the boundary, and the agent dies with the session. Use this
+          when the container must run <code>git</code> itself.</p>
+      </div>
+    </div>
+    <p class="note"><strong>Dogfooded:</strong> this repository was first published through its
+      own gate — a credential-less <span class="mono">tup push</span> inside the container drove
+      a host gatekeeper that did the authenticated push.</p>
+  </section>
+
+  <section>
+    <h2>Get started</h2>
+    <p class="m">Linux with unprivileged user namespaces. Build with Cargo:</p>
+    <pre class="code"><span class="c"># binary at target/release/tup — put it on your PATH</span>
+cargo build --release</pre>
+    <p class="lst" style="margin-top:16px">Two backends render one spec, so they can't drift:
+      <strong>pyrex</strong> (default, raw namespace syscalls, no helper — falls back to bwrap
+      where user namespaces are unavailable) and <strong>bubblewrap</strong>
+      (<code>TUP_SANDBOX=bwrap</code>). <span class="mono">tup</span> assumes a cooperative agent:
+      the isolation catches mistakes, and egress stays open for the model API and package
+      mirrors.</p>
+  </section>
+
+  <footer>
+    <a class="btn" href="https://github.com/Garfield1002/tups">View on GitHub →</a>
+    <p>A one-command harness for keeping a coding agent contained and portable.
+      See <a href="https://github.com/Garfield1002/tups/blob/main/DESIGN.md">DESIGN.md</a> for
+      the full model — the migration protocol, the backend seam, and the capability model.</p>
+  </footer>
+
+</div>
+</body>
+</html>

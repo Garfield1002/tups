@@ -177,6 +177,7 @@ pub(crate) fn cmd_stop(args: &[String]) {
             exit(2);
         }
     };
+    crate::project::ensure_valid_name(&project);
     let pid = match find_init_pid(&project) {
         Some(p) => p,
         None => {
@@ -187,8 +188,10 @@ pub(crate) fn cmd_stop(args: &[String]) {
     eprintln!("[tup] stopping '{project}' (init pid {pid}) — running quiesce");
     // SIGTERM to PID 1; it runs stop hooks and the sweep, then exits and disappears host-side.
     unsafe { libc::kill(pid, libc::SIGTERM) };
+    // Poll via find_init_pid (which re-verifies the cmdline), never a bare kill(pid, 0): once
+    // init exits, the OS may recycle its PID, and we must not then SIGKILL the innocent reuser.
     for _ in 0..150 {
-        if unsafe { libc::kill(pid, 0) } != 0 {
+        if find_init_pid(&project) != Some(pid) {
             println!("stopped '{project}'");
             return;
         }
@@ -218,6 +221,9 @@ pub(crate) fn cmd_rm(args: &[String]) {
             exit(2);
         }
     };
+    // Validate BEFORE deriving a path: `tup rm ..` must never resolve to ~/.tup/.. (= $HOME)
+    // and be handed to remove_dir_all.
+    crate::project::ensure_valid_name(&project);
     let dir = project_dir(&project);
     if !dir.is_dir() {
         eprintln!("tup: no such project '{project}' (nothing under {})", dir.display());

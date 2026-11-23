@@ -11,18 +11,22 @@ pub(crate) fn project_dir(project: &str) -> PathBuf {
     PathBuf::from(home).join(".tup").join(project)
 }
 
-/// Validate a project name and ensure its rw root exists, returning the root path.
-///
-/// The charset is deliberately tight (`[A-Za-z0-9._-]`, no leading dot): the name is
-/// interpolated into remote shell strings by `tup move` (ssh/pgrep), so anything looser
-/// is both a portability hazard and a shell-injection vector. See DESIGN.md review notes.
-pub(crate) fn ensure_project_root(project: &str) -> PathBuf {
+/// Exit with a usage error unless `project` is a valid name. Every verb that turns a name
+/// into a filesystem path (`~/.tup/<name>`) or a remote shell string MUST call this first —
+/// an unvalidated name like `..` resolves `project_dir` to the parent of `~/.tup`, which a
+/// destructive verb (`tup rm`) would then delete. See [`valid_name`].
+pub(crate) fn ensure_valid_name(project: &str) {
     if !valid_name(project) {
         eprintln!(
-            "tup: invalid project name '{project}' (allowed: letters, digits, '.', '_', '-'; not '.'/'..'; no leading '.')"
+            "tup: invalid project name '{project}' (allowed: letters, digits, '.', '_', '-'; not '.'/'..'; no leading '.' or '-')"
         );
         exit(2);
     }
+}
+
+/// Validate a project name and ensure its rw root exists, returning the root path.
+pub(crate) fn ensure_project_root(project: &str) -> PathBuf {
+    ensure_valid_name(project);
     let root = project_dir(project).join("root");
     if let Err(e) = fs::create_dir_all(&root) {
         eprintln!("tup: cannot create {}: {e}", root.display());
@@ -31,11 +35,16 @@ pub(crate) fn ensure_project_root(project: &str) -> PathBuf {
     root
 }
 
-fn valid_name(project: &str) -> bool {
+/// The charset is deliberately tight (`[A-Za-z0-9._-]`, no leading dot or dash): the name is
+/// interpolated into remote shell strings by `tup move` (ssh/pgrep) and into `~/.tup/<name>`
+/// paths, so anything looser is a shell-injection, path-traversal, and flag-confusion vector
+/// (a leading `-` would also masquerade as a CLI flag). See DESIGN.md review notes.
+pub(crate) fn valid_name(project: &str) -> bool {
     !project.is_empty()
         && project != "."
         && project != ".."
         && !project.starts_with('.')
+        && !project.starts_with('-')
         && project
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
@@ -55,6 +64,15 @@ mod tests {
     #[test]
     fn rejects_empty_and_dot_forms() {
         for n in ["", ".", "..", ".hidden"] {
+            assert!(!valid_name(n), "{n:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_leading_dash_flag_lookalikes() {
+        // A leading '-' would both masquerade as a CLI flag and (for `..`-style names) was the
+        // path-traversal vector the lifecycle verbs now guard against.
+        for n in ["-f", "-y", "--force", "--yes", "-"] {
             assert!(!valid_name(n), "{n:?} should be rejected");
         }
     }

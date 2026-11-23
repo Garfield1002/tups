@@ -41,13 +41,29 @@ fn install_forwarders() {
     }
 }
 
+/// Does `pid`'s cmdline identify it as *this project's* `tup init`? Guards against a stale
+/// `init.pid` whose PID the OS has recycled for an unrelated process — important because
+/// `tup stop` sends it a fatal signal.
+fn cmdline_is_init(pid: i32, project: &str) -> bool {
+    let data = match fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    let parts: Vec<&[u8]> = data.split(|b| *b == 0).filter(|s| !s.is_empty()).collect();
+    parts.len() >= 3
+        && parts[0] == b"/run/tup"
+        && parts[1] == b"init"
+        && parts[2] == project.as_bytes()
+}
+
 /// Find the host-visible pid of a project's sandbox PID 1. Prefer the pidfile the Pyrex
 /// backend writes (exact, owner-scoped); fall back to scanning /proc for `tup init`'s
-/// cmdline (the bwrap backend can't hand us the inner PID 1's host pid directly).
+/// cmdline (the bwrap backend can't hand us the inner PID 1's host pid directly). Either way
+/// the candidate's cmdline is verified, so a stale/recycled PID is never returned.
 pub(crate) fn find_init_pid(project: &str) -> Option<i32> {
     if let Ok(s) = fs::read_to_string(project_dir(project).join("init.pid")) {
         if let Ok(p) = s.trim().parse::<i32>() {
-            if p > 0 && unsafe { libc::kill(p, 0) } == 0 {
+            if p > 0 && unsafe { libc::kill(p, 0) } == 0 && cmdline_is_init(p, project) {
                 return Some(p);
             }
         }
@@ -58,16 +74,7 @@ pub(crate) fn find_init_pid(project: &str) -> Option<i32> {
             Ok(p) => p,
             Err(_) => continue,
         };
-        let data = match fs::read(format!("/proc/{pid}/cmdline")) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        let parts: Vec<&[u8]> = data.split(|b| *b == 0).filter(|s| !s.is_empty()).collect();
-        if parts.len() >= 3
-            && parts[0] == b"/run/tup"
-            && parts[1] == b"init"
-            && parts[2] == project.as_bytes()
-        {
+        if cmdline_is_init(pid, project) {
             return Some(pid);
         }
     }

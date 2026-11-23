@@ -127,7 +127,7 @@ pub(crate) fn launch(spec: Spec) -> Command {
     a.push("--".into());
     a.extend(spec.inner.iter().cloned());
 
-    wrap_pasta(spec.net, &launcher, &a)
+    wrap_pasta(spec.net, &launcher, &a, &spec.ports)
 }
 
 // ---------------------------------------------------------------------------
@@ -683,6 +683,9 @@ fn parse(args: &[OsString]) -> Spec {
         profile,
         forward_agent,
         extra,
+        // Port forwards are a host-side pasta concern (applied by `wrap_pasta` before the
+        // sandbox is entered); the in-container launcher never needs them.
+        ports: Vec::new(),
         inner,
     }
 }

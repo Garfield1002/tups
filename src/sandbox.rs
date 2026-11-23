@@ -8,7 +8,7 @@
 //! Networking: for `Net::Pasta` the launcher is wrapped in pasta (outer netns + NAT
 //! egress + DNS forward); the backend's own process runs *inside* pasta's namespaces.
 
-use crate::net::{ensure_resolv, Net, PASTA_DNS};
+use crate::net::{ensure_resolv, Net, PortForward, Proto, PASTA_DNS};
 use crate::nixenv::{self, EnvMode};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -56,7 +56,38 @@ pub(crate) struct Spec {
     /// A credential agent's socket is bound (via `extra`) at `AGENT_SOCK`; set `SSH_AUTH_SOCK`.
     pub forward_agent: bool,
     pub extra: Vec<Bind>,
+    /// Port forwards to install in pasta (ignored for `Net::Host`/`Net::None`).
+    pub ports: Vec<PortForward>,
     pub inner: Vec<OsString>,
+}
+
+/// Parse a `--map HOST:CONTAINER[:ro]` spec into a `Bind` with distinct host/container paths
+/// (rw by default; a trailing `:ro` — or `:rw` — sets access). Paths may rarely contain a
+/// colon, so the access suffix is stripped first and the remainder split on the LAST colon;
+/// both sides must be absolute.
+pub(crate) fn map_from_str(s: &str) -> Result<Bind, String> {
+    let s = s.trim();
+    let (body, ro) = if let Some(rest) = s.strip_suffix(":ro") {
+        (rest, true)
+    } else if let Some(rest) = s.strip_suffix(":rw") {
+        (rest, false)
+    } else {
+        (s, false)
+    };
+    let (host, container) = body
+        .rsplit_once(':')
+        .ok_or_else(|| format!("--map needs HOST:CONTAINER[:ro] (got {s:?})"))?;
+    if host.is_empty() || container.is_empty() {
+        return Err(format!("--map needs both HOST and CONTAINER paths (got {s:?})"));
+    }
+    if !host.starts_with('/') || !container.starts_with('/') {
+        return Err(format!("--map paths must be absolute (got {s:?})"));
+    }
+    Ok(Bind {
+        src: PathBuf::from(host),
+        dst: PathBuf::from(container),
+        ro,
+    })
 }
 
 /// The shared read-only system layer plus the project's rw root and virtual filesystems,
@@ -297,8 +328,10 @@ pub(crate) fn clears_env(spec: &Spec) -> bool {
     spec.env == EnvMode::Nix
 }
 
-/// Wrap a launcher argv in pasta when `Net::Pasta`; otherwise run it directly.
-pub(crate) fn wrap_pasta(net: Net, launcher: &str, args: &[OsString]) -> Command {
+/// Wrap a launcher argv in pasta when `Net::Pasta`; otherwise run it directly. `ports` adds
+/// inbound host→guest port forwards (pasta's `--tcp-ports`/`--udp-ports`, each `HOST:CONTAINER`
+/// where HOST is pasta's local port and CONTAINER the in-namespace port); only used for pasta.
+pub(crate) fn wrap_pasta(net: Net, launcher: &str, args: &[OsString], ports: &[PortForward]) -> Command {
     match net {
         Net::Pasta => {
             let mut c = Command::new("pasta");
@@ -306,6 +339,17 @@ pub(crate) fn wrap_pasta(net: Net, launcher: &str, args: &[OsString]) -> Command
                 .arg("--dns-forward")
                 .arg(PASTA_DNS)
                 .arg("--quiet");
+            // Explicit port forwards. Giving any `--tcp-ports`/`--udp-ports` overrides pasta's
+            // default `auto` for that protocol, which is what an explicit `--port` wants. Flag
+            // syntax verified against `man pasta`: `-t 18080:3000` forwards the host's 18080 to
+            // port 3000 in the target namespace. Can be repeated, so one flag per forward.
+            for p in ports {
+                let flag = match p.proto {
+                    Proto::Tcp => "--tcp-ports",
+                    Proto::Udp => "--udp-ports",
+                };
+                c.arg(flag).arg(format!("{}:{}", p.host, p.container));
+            }
             // pasta execs its very first child specially — before its own uid/gid map is in force
             // for that execve — so a launcher binary owned by the (as-yet-unmapped) caller is
             // refused with EACCES, while a root-owned one runs. Interpose root-owned /usr/bin/env:
@@ -341,7 +385,61 @@ pub(crate) fn launch(spec: Spec) -> Command {
 
 #[cfg(test)]
 mod tests {
-    use super::AGENT_SOCK;
+    use super::{map_from_str, AGENT_SOCK};
+    use std::path::Path;
+
+    #[test]
+    fn map_rw_by_default() {
+        let b = map_from_str("/host/data:/work/data").unwrap();
+        assert_eq!(b.src, Path::new("/host/data"));
+        assert_eq!(b.dst, Path::new("/work/data"));
+        assert!(!b.ro);
+    }
+
+    #[test]
+    fn map_ro_suffix() {
+        let b = map_from_str("/host/data:/work/data:ro").unwrap();
+        assert_eq!(b.src, Path::new("/host/data"));
+        assert_eq!(b.dst, Path::new("/work/data"));
+        assert!(b.ro);
+    }
+
+    #[test]
+    fn map_rw_suffix_is_explicit_rw() {
+        let b = map_from_str("/a:/b:rw").unwrap();
+        assert_eq!(b.dst, Path::new("/b"));
+        assert!(!b.ro);
+    }
+
+    #[test]
+    fn map_splits_on_last_colon() {
+        // A host path that itself contains a colon: the HOST/CONTAINER split is the LAST colon,
+        // so the colon stays on the host side and the container is the final absolute segment.
+        let b = map_from_str("/ho:st:/work/data").unwrap();
+        assert_eq!(b.src, Path::new("/ho:st"));
+        assert_eq!(b.dst, Path::new("/work/data"));
+        assert!(!b.ro);
+        // ...and the same with an access suffix still parses.
+        let b = map_from_str("/ho:st:/work/data:ro").unwrap();
+        assert_eq!(b.src, Path::new("/ho:st"));
+        assert_eq!(b.dst, Path::new("/work/data"));
+        assert!(b.ro);
+    }
+
+    #[test]
+    fn map_rejects_malformed() {
+        for bad in [
+            "",                    // empty
+            "/onlyhost",           // no container (no colon)
+            "relative:/work/x",    // host not absolute
+            "/host/x:relative",    // container not absolute
+            ":/work/x",            // empty host
+            "/host/x:",            // empty container
+            "/host/x::ro",         // empty container with ro suffix
+        ] {
+            assert!(map_from_str(bad).is_err(), "expected {bad:?} to be rejected");
+        }
+    }
 
     #[test]
     fn agent_sock_is_a_sibling_of_the_supervisor_binary() {

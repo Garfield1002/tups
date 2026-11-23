@@ -76,5 +76,5 @@ fn render(spec: &Spec) -> Vec<OsString> {
 
 pub(crate) fn launch(spec: Spec) -> Command {
     let args = render(&spec);
-    wrap_pasta(spec.net, "bwrap", &args)
+    wrap_pasta(spec.net, "bwrap", &args, &spec.ports)
 }

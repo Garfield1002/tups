@@ -246,7 +246,8 @@ Everything except the move round-trip is assembling known-good parts. Prove the 
    *(persist volumes done via `outputs.tup.persist` — see slice 7 piece 4.)*
 5. **`tup move` + `tup preflight`** — the between-turn migration round-trip over SSH.
 6. **`tup attach`** — roaming client reattach. *(done: `nsenter` into the live container's
-   user/mount/uts/ipc/pid/net namespaces, clean per-env PATH; plus `tup ps` to list projects.)*
+   user/mount/uts/ipc/pid/net namespaces, clean per-env PATH; plus `tup ps` to list projects,
+   `tup stop` for a clean quiesce from outside, and `tup rm` to delete project state.)*
 7. **Nix env integration** — flake eval → store paths → bind-mount; prologues.
    *(pieces 1–4 done: hermetic `--env nix` — flake → profile → PATH is just the profile, host
    /usr dropped; prologues (base + opt-in languages, `tup env`); `outputs.tup` net/persist/binds;

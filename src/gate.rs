@@ -157,9 +157,12 @@ fn handle_conn(mut stream: UnixStream, policy: &GatePolicy, tree: &PathBuf) {
 /// Drive the git gate from inside the container: send `op args…`, relay the result. The
 /// container never sees a credential — it only asks the host to perform the filtered op.
 pub(crate) fn drive(op: &str, args: &[String]) -> ! {
-    let mut stream = UnixStream::connect(GATE_SOCK).unwrap_or_else(|e| {
+    // The forwarded gate socket is at GATE_SOCK for a flake-declared gate; TUP_GATE_SOCK lets
+    // a bootstrap / already-running container point at a gate socket in an already-bound dir.
+    let sock = std::env::var("TUP_GATE_SOCK").unwrap_or_else(|_| GATE_SOCK.to_string());
+    let mut stream = UnixStream::connect(&sock).unwrap_or_else(|e| {
         eprintln!(
-            "tup {op}: no git gate available for this project ({e}).\n  Declare one in the flake: outputs.tup.gates.git = {{ remote = \"…\"; allow = [ \"{op}\" ]; }};"
+            "tup {op}: no git gate at {sock} ({e}).\n  Declare one in the flake (outputs.tup.gates.git) or run `tup gate serve` on the host and set TUP_GATE_SOCK."
         );
         exit(1);
     });
@@ -188,6 +191,90 @@ pub(crate) fn drive(op: &str, args: &[String]) -> ! {
     }
     eprintln!("tup {op}: malformed gate response");
     exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// `tup gate serve` — a standalone host-side gatekeeper (bootstrap / non-flake use)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn cmd_gate(args: &[String]) {
+    match args.first().map(String::as_str) {
+        Some("serve") => gate_serve(&args[1..]),
+        _ => {
+            eprintln!(
+                "usage: tup gate serve --remote <url> --allow <push,fetch> [--refs <csv>] --sock <path> [--tree <dir>]\n\
+                 Runs a gatekeeper on the host (with the host's git creds). Put --sock in a dir\n\
+                 bound into the container, then inside set TUP_GATE_SOCK=<that path> and `tup push`."
+            );
+            exit(2);
+        }
+    }
+}
+
+fn gate_serve(args: &[String]) -> ! {
+    let mut remote = String::new();
+    let mut allow: Vec<String> = Vec::new();
+    let mut refs: Vec<String> = Vec::new();
+    let mut sock: Option<PathBuf> = None;
+    let mut tree = PathBuf::from(".");
+    let csv = |s: &str| -> Vec<String> {
+        s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let next = |i: usize| -> String {
+            args.get(i + 1).cloned().unwrap_or_else(|| {
+                eprintln!("tup gate serve: {} needs a value", args[i]);
+                exit(2);
+            })
+        };
+        match args[i].as_str() {
+            "--remote" => remote = next(i),
+            "--allow" => allow = csv(&next(i)),
+            "--refs" => refs = csv(&next(i)),
+            "--sock" => sock = Some(PathBuf::from(next(i))),
+            "--tree" => tree = PathBuf::from(next(i)),
+            other => {
+                eprintln!("tup gate serve: unexpected arg '{other}'");
+                exit(2);
+            }
+        }
+        i += 2;
+    }
+    if remote.is_empty() || allow.is_empty() || sock.is_none() {
+        eprintln!("tup gate serve: --remote, --allow and --sock are required");
+        exit(2);
+    }
+    let sock = sock.unwrap();
+    let tree = std::fs::canonicalize(&tree).unwrap_or(tree);
+    let policy = GatePolicy { remote, allow, refs };
+    serve_foreground(&sock, policy, &tree)
+}
+
+/// Run the gatekeeper in the foreground (blocking) until killed — for `tup gate serve`.
+fn serve_foreground(sock: &PathBuf, policy: GatePolicy, tree: &PathBuf) -> ! {
+    let _ = std::fs::remove_file(sock);
+    if let Some(p) = sock.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    let listener = UnixListener::bind(sock).unwrap_or_else(|e| {
+        eprintln!("tup gate serve: cannot bind {}: {e}", sock.display());
+        exit(1);
+    });
+    eprintln!(
+        "[tup gatekeeper] serving {} — allow={:?} refs={:?} remote={} tree={} (Ctrl-C to stop)",
+        sock.display(),
+        policy.allow,
+        policy.refs,
+        policy.remote,
+        tree.display()
+    );
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => handle_conn(stream, &policy, tree),
+            Err(e) => eprintln!("[tup gatekeeper] accept error: {e}"),
+        }
+    }
 }
 
 #[cfg(test)]

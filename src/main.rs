@@ -70,6 +70,8 @@ fn main() {
         // Container-side gate drivers: ask the host gatekeeper to run the filtered op.
         "push" => gate::drive("push", &rest),
         "fetch" => gate::drive("fetch", &rest),
+        // Host-side standalone gatekeeper (bootstrap / non-flake use).
+        "gate" => gate::cmd_gate(&rest),
         "version" | "--version" | "-V" => println!("tup {VERSION}"),
         "help" | "--help" | "-h" => print_help(),
         other => {
@@ -106,6 +108,7 @@ COMMANDS:
     stop <project>                                  clean-stop a running project   [implemented]
     rm [--force] <project>                          delete a project's state       [implemented]
     push [<ref>] / fetch [<ref>]       drive the project's git gate (host does the op) [implemented]
+    gate serve --remote U --allow push --sock P [--tree D] [--refs R]  run a gatekeeper [implemented]
     move <project> <dest>                           migrate a session              [implemented]
     attach <project> [-- <cmd>]                     join a running container       [implemented]
     preflight <project>                             report the cost/loss of a move [implemented]

@@ -125,8 +125,11 @@ stakes; it does **not** turn `tup` into a security boundary.
 
 - **pyrex** *(default)* — an in-house backend using raw namespace syscalls. No external helper
   binary; owning the `fork` gives tup the sandbox PID 1's host pid directly (written to
-  `init.pid`). It is **not** a security sandbox (weaker mount/cap handling than bwrap) — which
-  is fine here, since tups is a cooperative-model tool, not a boundary.
+  `init.pid`). Where unprivileged user namespaces aren't available, tup automatically falls
+  back to bwrap. It is **not** a security sandbox (weaker mount/cap handling than bwrap) —
+  which is fine here, since tups is a cooperative-model tool, not a boundary. Verified for
+  `--net none`/`host`; pyrex with the default `--net pasta` is **not yet verified** (pasta
+  can't nest in the current test environment), so treat that combination as unproven.
 - **bubblewrap** — shells out to `bwrap` (audited mount handling). Select it with
   `TUP_SANDBOX=bwrap`, or build a bwrap-only binary with `--no-default-features`.
 

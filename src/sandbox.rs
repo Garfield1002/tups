@@ -305,7 +305,9 @@ pub(crate) fn wrap_pasta(net: Net, launcher: &str, args: &[OsString]) -> Command
 pub(crate) fn launch(spec: Spec) -> Command {
     #[cfg(feature = "pyrex")]
     {
-        if crate::pyrex::selected() {
+        // Early-return only for pyrex; the Bwrap choice falls through to the tail below, which
+        // is also the sole path in a `--no-default-features` build.
+        if let crate::pyrex::Choice::Pyrex = crate::pyrex::choose() {
             return crate::pyrex::launch(spec);
         }
     }

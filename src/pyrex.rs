@@ -31,10 +31,61 @@ use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 /// Runtime switch: the backend is compiled in but still off unless asked for.
-/// Whether to use the pyrex backend. Pyrex is the default when compiled in, so this is true
-/// unless the user explicitly opts back into bubblewrap with `TUP_SANDBOX=bwrap`.
-pub(crate) fn selected() -> bool {
-    std::env::var("TUP_SANDBOX").map(|v| v != "bwrap").unwrap_or(true)
+/// Which backend to launch.
+pub(crate) enum Choice {
+    Pyrex,
+    Bwrap,
+}
+
+/// Decide the backend from `TUP_SANDBOX` and host capability. An explicit value wins (and an
+/// unrecognized one warns rather than silently picking a backend the user didn't name);
+/// otherwise pyrex is the default, falling back to bwrap where this host can't create a user
+/// namespace.
+pub(crate) fn choose() -> Choice {
+    match std::env::var("TUP_SANDBOX").ok().as_deref() {
+        Some("bwrap") => Choice::Bwrap,
+        // Explicit opt-in: honor it even if the userns probe would say no (the user may know
+        // their setup better than the probe, e.g. a capability we don't test for).
+        Some("pyrex") => Choice::Pyrex,
+        Some(other) => {
+            eprintln!(
+                "[tup] warning: unknown TUP_SANDBOX '{other}' (want 'pyrex' or 'bwrap'); using the default"
+            );
+            default_choice()
+        }
+        None => default_choice(),
+    }
+}
+
+/// The default when `TUP_SANDBOX` is unset: pyrex, unless this host can't make an unprivileged
+/// user namespace — then fall back to bwrap (which a setuid install can still satisfy) rather
+/// than hard-fail a path the previous bwrap default handled.
+fn default_choice() -> Choice {
+    if userns_available() {
+        Choice::Pyrex
+    } else {
+        eprintln!("[tup] note: unprivileged user namespaces unavailable here; using the bwrap backend");
+        Choice::Bwrap
+    }
+}
+
+/// Probe whether an unprivileged user namespace can be created, in a throwaway forked child so
+/// the current process is left untouched. Called only on the default path (not for an explicit
+/// `TUP_SANDBOX`), and before tup spawns any threads, so the `fork` is safe.
+fn userns_available() -> bool {
+    unsafe {
+        let pid = libc::fork();
+        if pid == 0 {
+            let r = libc::unshare(libc::CLONE_NEWUSER);
+            libc::_exit(if r == 0 { 0 } else { 1 });
+        }
+        if pid < 0 {
+            return false;
+        }
+        let mut status = 0;
+        libc::waitpid(pid, &mut status, 0);
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+    }
 }
 
 /// Host side: build the `pasta? -- tup __sandbox <spec> -- <cmd>` launch command.

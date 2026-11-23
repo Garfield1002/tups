@@ -245,3 +245,49 @@ fn only_init_left() -> bool {
     }
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_first_separates_keyword_from_rest() {
+        assert_eq!(split_first("start foo bar baz"), ("start", "foo bar baz"));
+        assert_eq!(split_first("solo"), ("solo", ""));
+        assert_eq!(split_first("a  b"), ("a", "b")); // collapses the gap after the first token
+        assert_eq!(split_first(""), ("", ""));
+    }
+
+    #[test]
+    fn load_services_parses_manifest() {
+        // A unique temp manifest; load_services takes a path, so no container needed.
+        let p = std::env::temp_dir().join(format!(
+            "tup-test-svcs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(
+            &p,
+            "# a comment\n\nstart web run-server\nstop  web graceful-stop\nstart db dbd\n",
+        )
+        .unwrap();
+        let svcs = load_services(p.to_str().unwrap());
+        fs::remove_file(&p).ok();
+
+        assert_eq!(svcs.len(), 2); // web and db; comment + blank skipped
+        let web = svcs.iter().find(|s| s.name == "web").unwrap();
+        assert_eq!(web.start.as_deref(), Some("run-server"));
+        assert_eq!(web.stop.as_deref(), Some("graceful-stop"));
+        let db = svcs.iter().find(|s| s.name == "db").unwrap();
+        assert_eq!(db.start.as_deref(), Some("dbd"));
+        assert_eq!(db.stop, None); // no stop hook declared
+    }
+
+    #[test]
+    fn load_services_missing_file_is_empty() {
+        assert!(load_services("/nonexistent/tup/services/path").is_empty());
+    }
+}

@@ -74,8 +74,8 @@ pub(crate) fn cmd_ps(_args: &[String]) {
     // Running first, then alphabetical.
     rows.sort_by(|a, b| b.1.is_some().cmp(&a.1.is_some()).then(a.0.cmp(&b.0)));
     println!(
-        "{:<20} {:<8} {:<8} {:<6} {:<5} {}",
-        "PROJECT", "STATE", "PID", "NET", "ENV", "SVCS"
+        "{:<20} {:<8} {:<8} {:<6} {:<5} SVCS",
+        "PROJECT", "STATE", "PID", "NET", "ENV"
     );
     for (name, pid, net, nix, svcs) in rows {
         println!(

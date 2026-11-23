@@ -40,3 +40,34 @@ fn valid_name(project: &str) -> bool {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
 }
+
+#[cfg(test)]
+mod tests {
+    use super::valid_name;
+
+    #[test]
+    fn accepts_ordinary_names() {
+        for n in ["web", "my-app", "api_v2", "a.b.c", "Proj1", "x"] {
+            assert!(valid_name(n), "{n} should be valid");
+        }
+    }
+
+    #[test]
+    fn rejects_empty_and_dot_forms() {
+        for n in ["", ".", "..", ".hidden"] {
+            assert!(!valid_name(n), "{n:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_shell_injection_and_path_chars() {
+        // The name is interpolated into remote ssh/pgrep strings by `tup move`, so anything
+        // that could break out of a shell token or traverse the filesystem must be rejected.
+        for n in [
+            "a/b", "a b", "a;rm", "a$(x)", "a`x`", "a|b", "a&b", "a>b", "a..b/..", "a\nb", "a'b",
+            "a\"b", "a*b",
+        ] {
+            assert!(!valid_name(n), "{n:?} should be rejected");
+        }
+    }
+}

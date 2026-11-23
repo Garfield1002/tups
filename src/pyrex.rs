@@ -40,18 +40,19 @@ pub(crate) fn launch(spec: Spec) -> Command {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("tup"));
     let launcher = exe.to_string_lossy().into_owned();
 
-    let mut a: Vec<OsString> = Vec::new();
-    a.push("__sandbox".into());
-    a.push("--root".into());
-    a.push(spec.root.clone().into_os_string());
-    a.push("--project".into());
-    a.push(OsString::from(&spec.project));
-    a.push("--net".into());
-    a.push(OsString::from(spec.net.label()));
-    a.push("--chdir".into());
-    a.push(OsString::from(&spec.chdir));
-    a.push("--env".into());
-    a.push(OsString::from(spec.env.label()));
+    let mut a: Vec<OsString> = vec![
+        "__sandbox".into(),
+        "--root".into(),
+        spec.root.clone().into_os_string(),
+        "--project".into(),
+        OsString::from(&spec.project),
+        "--net".into(),
+        OsString::from(spec.net.label()),
+        "--chdir".into(),
+        OsString::from(&spec.chdir),
+        "--env".into(),
+        OsString::from(spec.env.label()),
+    ];
     if let Some(p) = &spec.profile {
         a.push("--nix-profile".into());
         a.push(p.clone().into_os_string());

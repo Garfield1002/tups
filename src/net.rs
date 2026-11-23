@@ -60,3 +60,28 @@ pub(crate) fn ensure_resolv(project: &str) -> PathBuf {
     let _ = fs::write(&p, format!("nameserver {PASTA_DNS}\n"));
     p
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_known_modes() {
+        assert!(net_from_str(Some("pasta")) == Net::Pasta);
+        assert!(net_from_str(Some("host")) == Net::Host);
+        assert!(net_from_str(Some("none")) == Net::None);
+    }
+
+    #[test]
+    fn labels_round_trip() {
+        for m in [Net::Pasta, Net::Host, Net::None] {
+            assert!(net_from_str(Some(m.label())) == m);
+        }
+    }
+
+    #[test]
+    fn pasta_dns_is_non_loopback() {
+        // pasta rejects a loopback forward address, so this must never drift into 127.0.0.0/8.
+        assert!(!PASTA_DNS.starts_with("127."));
+    }
+}

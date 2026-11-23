@@ -387,8 +387,7 @@ fn warn_tup(attr: &str, err: &str) {
         .lines()
         .filter_map(|l| l.trim().strip_prefix("error:"))
         .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .last()
+        .rfind(|m| !m.is_empty())
         .unwrap_or("eval failed (see nix output)");
     eprintln!("[tup] warning: ignoring outputs.tup.{attr} — {msg}");
 }
@@ -541,4 +540,75 @@ fn edit(project: &str, names: &[String], add: bool) {
     let _ = std::fs::write(env_dir(project).join("active.nix"), render_active_nix(&active));
     println!("active prologues: {}", active.join(" "));
     println!("(run `tup run --env nix {project}` to rebuild)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_mode_parses() {
+        assert!(env_mode_from_str(Some("nix")) == EnvMode::Nix);
+        assert!(env_mode_from_str(Some("host")) == EnvMode::Host);
+    }
+
+    #[test]
+    fn prologue_membership() {
+        assert!(is_prologue("base"));
+        assert!(is_prologue("rust"));
+        assert!(is_prologue("python"));
+        assert!(!is_prologue("bogus"));
+        assert!(!is_prologue(""));
+    }
+
+    #[test]
+    fn active_selection_round_trips() {
+        let sel = vec!["base".to_string(), "rust".to_string(), "python".to_string()];
+        let rendered = render_active_nix(&sel);
+        assert_eq!(rendered.trim(), r#"[ "base" "rust" "python" ]"#);
+        assert_eq!(parse_active_nix(&rendered), sel);
+    }
+
+    #[test]
+    fn parse_active_tolerates_whitespace_and_empty() {
+        assert_eq!(parse_active_nix("[ \"a\"   \"b\" ]\n"), vec!["a", "b"]);
+        assert!(parse_active_nix("[ ]").is_empty());
+        assert!(parse_active_nix("").is_empty());
+    }
+
+    #[test]
+    fn prologues_nix_lists_every_registered_profile() {
+        let s = render_prologues_nix();
+        for (name, _) in PROLOGUES {
+            assert!(s.contains(&format!("{name} = [")), "missing {name}");
+        }
+        assert!(s.starts_with("{ pkgs }:"));
+    }
+
+    #[test]
+    fn persist_slug_is_deterministic_and_version_stable() {
+        // Version-stable: these literals pin the FNV-1a output. If this breaks, a `tup move`
+        // would map a volume to a different backing dir on the target and silently lose data.
+        assert_eq!(persist_slug(Path::new("/var/lib/pg")), persist_slug(Path::new("/var/lib/pg")));
+        assert_eq!(persist_slug(Path::new("/var/lib/pg")), "var_lib_pg-45076689");
+    }
+
+    #[test]
+    fn persist_slug_separates_paths_that_sanitize_alike() {
+        // `/a/b` and `/a_b` both sanitize to base `a_b`; the full-path hash must keep them apart.
+        let a = persist_slug(Path::new("/a/b"));
+        let b = persist_slug(Path::new("/a_b"));
+        assert_ne!(a, b);
+        assert!(a.starts_with("a_b-") && b.starts_with("a_b-"));
+    }
+
+    #[test]
+    fn persist_slug_handles_root_and_charset() {
+        let s = persist_slug(Path::new("/"));
+        assert!(s.starts_with("root-"), "got {s}");
+        // Slug is filesystem-safe: alphanumerics, underscore, and the single hash hyphen only.
+        for s in [persist_slug(Path::new("/x/y z!")), persist_slug(Path::new("/"))] {
+            assert!(s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+        }
+    }
 }

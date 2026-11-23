@@ -1,0 +1,9 @@
+{
+  "name": "tup-example-node",
+  "version": "0.1.0",
+  "description": "A tup zero-config vanilla-JS example",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  }
+}

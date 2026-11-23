@@ -31,8 +31,10 @@ use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 /// Runtime switch: the backend is compiled in but still off unless asked for.
+/// Whether to use the pyrex backend. Pyrex is the default when compiled in, so this is true
+/// unless the user explicitly opts back into bubblewrap with `TUP_SANDBOX=bwrap`.
 pub(crate) fn selected() -> bool {
-    std::env::var("TUP_SANDBOX").map(|v| v == "pyrex").unwrap_or(false)
+    std::env::var("TUP_SANDBOX").map(|v| v != "bwrap").unwrap_or(true)
 }
 
 /// Host side: build the `pasta? -- tup __sandbox <spec> -- <cmd>` launch command.

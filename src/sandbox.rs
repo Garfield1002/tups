@@ -299,9 +299,9 @@ pub(crate) fn wrap_pasta(net: Net, launcher: &str, args: &[OsString]) -> Command
     }
 }
 
-/// Build the launch `Command`, selecting the backend. The `pyrex` backend is compiled in
-/// only under its feature and is still opt-in at runtime via `TUP_SANDBOX=pyrex`, so the
-/// default path is always the proven bwrap backend.
+/// Build the launch `Command`, selecting the backend. The `pyrex` backend is the default
+/// (compiled in unless `--no-default-features`); `TUP_SANDBOX=bwrap` opts back into the
+/// bubblewrap backend, which is also the only option in a `--no-default-features` build.
 pub(crate) fn launch(spec: Spec) -> Command {
     #[cfg(feature = "pyrex")]
     {

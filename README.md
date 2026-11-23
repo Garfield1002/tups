@@ -27,17 +27,19 @@ It's rootless (user namespaces, no daemon, no `sudo`), the per-project overhead 
 
 Linux with unprivileged user namespaces enabled. On the `PATH`:
 
-- [`bubblewrap`](https://github.com/containers/bubblewrap) (`bwrap`) — the default backend
 - [`passt`/`pasta`](https://passt.top/) — for `--net pasta` (NAT egress from a private netns)
 - `util-linux` (`nsenter`) — for `tup attach`
+- [`bubblewrap`](https://github.com/containers/bubblewrap) (`bwrap`) — only for the bwrap
+  backend (`TUP_SANDBOX=bwrap` or a `--no-default-features` build); the default backend
+  (pyrex) needs no external helper
 - [`nix`](https://nixos.org/) — only for `--env nix` (the hermetic flake environment)
 - `rsync` + `ssh` — only for `tup move`
 
 ## Build
 
 ```sh
-cargo build --release          # default: bubblewrap backend
-cargo build --release --features pyrex   # also compile the in-house namespace backend
+cargo build --release                      # default: includes the pyrex backend
+cargo build --release --no-default-features # bwrap-only binary (no raw-namespace backend)
 ```
 
 The binary is `target/release/tup`. Put it on your `PATH`.
@@ -121,10 +123,12 @@ stakes; it does **not** turn `tup` into a security boundary.
 
 `tup` renders one backend-neutral container spec through either of two backends:
 
-- **bubblewrap** *(default)* — shells out to `bwrap`.
-- **pyrex** — an in-house backend using raw namespace syscalls. Compile it in with
-  `--features pyrex`, then select it at runtime with `TUP_SANDBOX=pyrex` (the default stays
-  bubblewrap even when compiled in).
+- **pyrex** *(default)* — an in-house backend using raw namespace syscalls. No external helper
+  binary; owning the `fork` gives tup the sandbox PID 1's host pid directly (written to
+  `init.pid`). It is **not** a security sandbox (weaker mount/cap handling than bwrap) — which
+  is fine here, since tups is a cooperative-model tool, not a boundary.
+- **bubblewrap** — shells out to `bwrap` (audited mount handling). Select it with
+  `TUP_SANDBOX=bwrap`, or build a bwrap-only binary with `--no-default-features`.
 
 Both render the same ordered mount/op list, so they can't drift.
 

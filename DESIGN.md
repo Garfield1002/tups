@@ -199,8 +199,7 @@ The container spec is backend-neutral: `sandbox::Spec` + the ordered `Op` list f
 `base_ops` describe *what* to build; a backend decides *how*, rendering the **same** ops so
 the two can't drift.
 
-- **`bwrap`** (default) — renders ops to bubblewrap flags. Proven, audited mount handling.
-- **`pyrex`** (cargo `--features pyrex`, runtime `TUP_SANDBOX=pyrex`) — a small, cooperative,
+- **`pyrex`** (default; compiled in unless `--no-default-features`) — a small, cooperative,
   in-house namespace setup (unshare user/pid/mount/ipc/uts, flag-preserving ro binds,
   pivot_root, exec). **Not** a security sandbox (no symlink-safe mounts, no seccomp, weaker
   cap scrub) — the point is that owning the `fork` yields the sandbox PID 1's host pid for
@@ -208,9 +207,12 @@ the two can't drift.
   bwrap backend needs and lets tup own the whole death chain. Verified end-to-end for
   `--net none`/`--net host` and the `tup up` supervisor (pidfile + clean quiesce); `--net
   pasta` shares the bwrap path's `wrap_pasta` and is untested only because it can't run
-  nested inside a pasta'd session. Pitched as the eventual default once build+test in the
-  target uid/systemd setup is routine; see the review notes for why (pidfd, seccomp fd,
-  die-with-parent chain).
+  nested inside a pasta'd session. Made the default (2026-11-23): no external helper, and it
+  owns the death chain; the weaker mount/cap handling is acceptable under the cooperative
+  (not-a-boundary) model.
+- **`bwrap`** (runtime `TUP_SANDBOX=bwrap`, or the sole backend under `--no-default-features`)
+  — renders ops to bubblewrap flags. Proven, audited mount handling; the fallback for anyone
+  who wants bwrap's hardening or lacks the kernel surface pyrex needs.
 - **Env:** Nix (store + flakes), binary cache; language caches (pnpm/uv/cargo, sccache) for
   by-hash derived state. *(Nix integration is a later slice; the namespace/move machinery does
   not depend on it.)*

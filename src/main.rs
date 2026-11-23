@@ -100,8 +100,8 @@ COMMANDS:
                  We don't advertise security; this just lowers the escape stakes.
 
 BACKENDS:
-    Default: bubblewrap. A build with `--features pyrex` also compiles an in-house
-    namespace backend, selected at runtime with TUP_SANDBOX=pyrex (default: bwrap).
+    Default: pyrex, an in-house raw-namespace backend. Set TUP_SANDBOX=bwrap to use
+    bubblewrap instead, or build with `--no-default-features` for a bwrap-only binary.
 
 Services are declared in ~/.tup/<project>/services, one directive per line:
     start <name> <shell command>

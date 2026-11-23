@@ -9,10 +9,10 @@ name = "tup"
 path = "src/main.rs"
 
 [features]
-default = []
-# Pyrex: an in-house namespace backend (a small, cooperative bubblewrap). Compiled in only with
-# `--features pyrex`, and still opt-in at runtime via TUP_SANDBOX=pyrex, so default builds are
-# unaffected. See src/pyrex.rs.
+# Pyrex (the in-house raw-namespace backend) is the default backend, compiled in by default.
+# Build with `--no-default-features` for a bwrap-only binary; at runtime, TUP_SANDBOX=bwrap
+# selects bubblewrap even in a default build. See src/pyrex.rs.
+default = ["pyrex"]
 pyrex = []
 
 [profile.release]

@@ -132,6 +132,29 @@ A container often needs to *use* a credential (git over ssh) but should never be
 It's **deny-by-default**: with no `agents` entry, the container reaches no host credentials at
 all. Declaring one in the flake (which you review, like `binds`) *is* the grant.
 
+### Gates (`outputs.tup.gates`) — a filtered escape hatch
+
+An `agent` lets the container *use* a credential; a **gate** goes further — the container holds
+**no authority at all**, just a socket it can send a request down. The **host** is the
+reference monitor (the "gatekeeper"): it reads the policy, filters the request, and performs
+the operation itself with its own credentials. Nothing — not the key, not a token — ever
+enters the container, and it can do *only* the whitelisted operation.
+
+```nix
+tup.gates.git = {
+  remote = "git@github.com:you/repo.git";  # the ONE target; the container can't change it
+  allow  = [ "push" "fetch" ];              # the only operations
+  # refs = [ "refs/heads/main" ];           # optional: narrow further
+};
+```
+
+Inside the container the agent runs `tup push main` / `tup fetch`; the gatekeeper validates it
+(operation allowed? ref allowed? no option injection?) and runs `git push`/`fetch` on the host
+in the project's working tree. Compared to `agents.ssh`, a gate is tighter: an ssh-agent can
+sign *anything*, but a gate can do *only* the declared op to the declared remote — the
+operation itself is the unit of authority, enforced host-side. This is the preferred model;
+`agents.ssh` remains the lower-level option for when the container needs to run git itself.
+
 ### Hardening (`--harden`)
 
 Drops all capabilities and starts a new session (TTY-injection proof). This lowers the escape

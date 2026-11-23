@@ -22,6 +22,7 @@ use std::process::exit;
 
 mod agent;
 mod bwrap;
+mod gate;
 #[cfg(feature = "pyrex")]
 mod pyrex;
 mod init;
@@ -66,6 +67,9 @@ fn main() {
         "attach" => status::cmd_attach(&rest),
         "stop" => status::cmd_stop(&rest),
         "rm" => status::cmd_rm(&rest),
+        // Container-side gate drivers: ask the host gatekeeper to run the filtered op.
+        "push" => gate::drive("push", &rest),
+        "fetch" => gate::drive("fetch", &rest),
         "version" | "--version" | "-V" => println!("tup {VERSION}"),
         "help" | "--help" | "-h" => print_help(),
         other => {
@@ -101,6 +105,7 @@ COMMANDS:
     ps                                              list projects and their state  [implemented]
     stop <project>                                  clean-stop a running project   [implemented]
     rm [--force] <project>                          delete a project's state       [implemented]
+    push [<ref>] / fetch [<ref>]       drive the project's git gate (host does the op) [implemented]
     move <project> <dest>                           migrate a session              [implemented]
     attach <project> [-- <cmd>]                     join a running container       [implemented]
     preflight <project>                             report the cost/loss of a move [implemented]

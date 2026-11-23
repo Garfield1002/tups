@@ -15,6 +15,7 @@
 //!     ("links") — lives as plain data in the flake's `tup` output, which tup reads with
 //!     `nix eval` and applies.
 
+use crate::gate::GatePolicy;
 use crate::net::Net;
 use crate::project::{ensure_project_root, project_dir};
 use crate::sandbox::Bind;
@@ -122,6 +123,13 @@ const FLAKE: &str = r#"{
         # entry here is an explicit grant (deny-by-default: nothing forwarded unless named).
         agents = {
           # ssh.key = "tups-deploy";   # git/ssh auth via an ssh-agent holding only this key
+        };
+        # Gates: a filtered escape hatch. The container holds only a socket; the HOST performs
+        # the operation and enforces this policy (deny-by-default), using its own credentials —
+        # nothing enters the container. The container drives it with `tup push` / `tup fetch`.
+        gates = {
+          # git = { remote = "git@github.com:you/repo.git"; allow = [ "push" "fetch" ]; };
+          #                                                 # refs = [ "refs/heads/main" ];  (optional)
         };
       };
     };
@@ -392,6 +400,34 @@ pub(crate) fn read_tup_config(project: &str) -> TupConfig {
         binds,
         ssh_agent_key,
     }
+}
+
+/// Read the project's `gates.git` policy, if declared. `None` when there is no gate (no
+/// `gates.git.remote`) — the remote is the required, container-unspecifiable target.
+pub(crate) fn read_gate(project: &str) -> Option<GatePolicy> {
+    let flakeref = env_dir(project).display().to_string();
+    let remote = nix_eval_tup(&flakeref, r#"c: c.gates.git.remote or """#)
+        .ok()?
+        .trim()
+        .to_string();
+    if remote.is_empty() {
+        return None;
+    }
+    let list = |apply: &str| -> Vec<String> {
+        nix_eval_tup(&flakeref, apply)
+            .map(|s| {
+                s.lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(|l| l.trim().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Some(GatePolicy {
+        remote,
+        allow: list(r#"c: builtins.concatStringsSep "\n" (c.gates.git.allow or [])"#),
+        refs: list(r#"c: builtins.concatStringsSep "\n" (c.gates.git.refs or [])"#),
+    })
 }
 
 /// Evaluate `apply` against the flake's `tup` output. `Ok` on success, `Err(stderr)` when the

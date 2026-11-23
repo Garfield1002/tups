@@ -3,8 +3,8 @@
 use crate::net::{net_from_str, Net};
 use crate::nixenv::{self, env_mode_from_str, EnvMode};
 use crate::project::ensure_project_root;
-use crate::sandbox::{launch, Bind, Spec, AGENT_SOCK};
-use crate::{agent, agent::Agent};
+use crate::sandbox::{launch, Bind, Spec, AGENT_SOCK, GATE_SOCK};
+use crate::{agent, agent::Agent, gate, gate::Gate};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::exit;
@@ -83,6 +83,7 @@ pub(crate) fn cmd_run(args: &[String]) {
     let chdir = chdir.unwrap_or_else(|| "/work".to_string());
     let mut forward_agent = false;
     let mut agent_handle: Option<Agent> = None;
+    let mut gate_handle: Option<Gate> = None;
     // Hermetic Nix env: realise the project's flake to a profile store path first (host side,
     // where nix + network + the store live).
     let profile: Option<PathBuf> = match env {
@@ -110,6 +111,20 @@ pub(crate) fn cmd_run(args: &[String]) {
                         agent_handle = Some(a);
                     }
                     Err(e) => eprintln!("[tup] warning: ssh agent '{name}' not forwarded: {e}"),
+                }
+            }
+            // Gate (outputs.tup.gates.git): start the host gatekeeper, forward only its socket.
+            if let Some(policy) = nixenv::read_gate(&project) {
+                match gate::spawn(policy, &project, root.clone()) {
+                    Ok(g) => {
+                        extra.push(Bind {
+                            src: g.sock.clone(),
+                            dst: PathBuf::from(GATE_SOCK),
+                            ro: false,
+                        });
+                        gate_handle = Some(g);
+                    }
+                    Err(e) => eprintln!("[tup] warning: git gate not started: {e}"),
                 }
             }
             Some(p)
@@ -143,9 +158,12 @@ pub(crate) fn cmd_run(args: &[String]) {
     };
     let mut c = launch(spec);
     let result = c.status();
-    // Reap the forwarded agent now the container has exited (before we exit the process).
+    // Reap the forwarded agent / gatekeeper now the container has exited.
     if let Some(a) = &agent_handle {
         a.stop();
+    }
+    if let Some(g) = &gate_handle {
+        g.stop();
     }
     match result {
         Ok(status) => exit(status.code().unwrap_or(1)),

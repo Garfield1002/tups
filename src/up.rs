@@ -3,8 +3,8 @@
 use crate::net::{net_from_str, write_net, Net};
 use crate::nixenv::{self, env_mode_from_str, EnvMode};
 use crate::project::{ensure_project_root, project_dir};
-use crate::sandbox::{launch, Bind, Spec, AGENT_SOCK};
-use crate::{agent, agent::Agent};
+use crate::sandbox::{launch, Bind, Spec, AGENT_SOCK, GATE_SOCK};
+use crate::{agent, agent::Agent, gate, gate::Gate};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -130,6 +130,7 @@ pub(crate) fn cmd_up(args: &[String]) {
     let mut tup_binds: Vec<Bind> = Vec::new();
     let mut forward_agent = false;
     let mut agent_handle: Option<Agent> = None;
+    let mut gate_handle: Option<Gate> = None;
     let profile = match env {
         EnvMode::Nix => {
             let p = nixenv::realize(&project);
@@ -154,6 +155,20 @@ pub(crate) fn cmd_up(args: &[String]) {
                         agent_handle = Some(a);
                     }
                     Err(e) => eprintln!("[tup] warning: ssh agent '{name}' not forwarded: {e}"),
+                }
+            }
+            // Gate (outputs.tup.gates.git): start the host gatekeeper, forward only its socket.
+            if let Some(policy) = nixenv::read_gate(&project) {
+                match gate::spawn(policy, &project, root.clone()) {
+                    Ok(g) => {
+                        tup_binds.push(Bind {
+                            src: g.sock.clone(),
+                            dst: PathBuf::from(GATE_SOCK),
+                            ro: false,
+                        });
+                        gate_handle = Some(g);
+                    }
+                    Err(e) => eprintln!("[tup] warning: git gate not started: {e}"),
                 }
             }
             Some(p)
@@ -236,9 +251,12 @@ pub(crate) fn cmd_up(args: &[String]) {
         eprintln!("tup: wait failed: {e}");
         exit(1);
     });
-    // Reap the forwarded agent now the supervised container has exited.
+    // Reap the forwarded agent / gatekeeper now the supervised container has exited.
     if let Some(a) = &agent_handle {
         a.stop();
+    }
+    if let Some(g) = &gate_handle {
+        g.stop();
     }
     exit(status.code().unwrap_or(0));
 }

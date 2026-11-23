@@ -20,6 +20,10 @@ use std::process::Command;
 /// supervisor binary — not under it, since that path is a file.)
 pub(crate) const AGENT_SOCK: &str = "/run/tup-agent.sock";
 
+/// Where a `gate`'s socket appears inside the container (a sibling of the `/run/tup` binary).
+/// The container holds only this socket; the host-side gatekeeper performs the filtered op.
+pub(crate) const GATE_SOCK: &str = "/run/tup-gate.sock";
+
 /// A caller-supplied bind (the project tree, ~/.claude, the exe at /run/tup, …).
 pub(crate) struct Bind {
     pub src: PathBuf,

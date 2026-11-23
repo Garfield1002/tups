@@ -12,6 +12,7 @@
 //!   pyrex       optional backend (feature "pyrex"): realise a Spec with raw namespace syscalls
 //!   run       `tup run`  — one-shot command
 //!   up        `tup up`   — launch + shepherd a PID-1 supervised container
+//!   status    `tup ps` / `tup attach` — list projects; join a running container
 //!   init      `tup init` — the in-container PID 1 / supervisor
 //!   migrate   `tup move` / `tup preflight` — the between-turn migration
 
@@ -28,6 +29,7 @@ mod nixenv;
 mod project;
 mod run;
 mod sandbox;
+mod status;
 mod up;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -41,9 +43,10 @@ fn main() {
         "init" => init::cmd_init(&args[2..]),
         "move" => migrate::cmd_move(&args[2..]),
         "preflight" => migrate::cmd_preflight(&args[2..]),
+        "ps" => status::cmd_ps(&args[2..]),
+        "attach" => status::cmd_attach(&args[2..]),
         // Internal: the pyrex backend re-execs the tup binary as the sandbox launcher.
         "__sandbox" => cmd_sandbox(&args[2..]),
-        "ps" | "attach" => stub(&args[1]),
         "version" | "--version" | "-V" => println!("tup {VERSION}"),
         "help" | "--help" | "-h" => print_help(),
         other => {
@@ -65,16 +68,6 @@ fn cmd_sandbox(_args: &[String]) -> ! {
     exit(2)
 }
 
-fn stub(cmd: &str) {
-    let planned = match cmd {
-        "ps" => "list running tup projects and their declared services",
-        "attach" => "attach a roaming client to a running project",
-        _ => "planned",
-    };
-    eprintln!("tup {cmd}: not implemented yet — planned: {planned}");
-    exit(69);
-}
-
 fn print_help() {
     println!(
         "tup {VERSION} — ultra-micro containers for coding agents
@@ -86,9 +79,9 @@ COMMANDS:
     run [--net M] [--env E] [--harden] <project> [-- <cmd>]   run in a namespace   [implemented]
     up  [--net M] [--env E] [--harden] <project>              PID-1 supervisor     [implemented]
     env <project> [list|add <p>|rm <p>]             inspect/edit env prologues     [implemented]
-    ps                                              list running projects          [planned]
+    ps                                              list projects and their state  [implemented]
     move <project> <dest>                           migrate a session              [implemented]
-    attach <project>                                attach a roaming client        [planned]
+    attach <project> [-- <cmd>]                     join a running container       [implemented]
     preflight <project>                             report the cost/loss of a move [implemented]
     help | version
 

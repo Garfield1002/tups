@@ -16,7 +16,7 @@
 //!     `nix eval` and applies.
 
 use crate::gate::GatePolicy;
-use crate::net::Net;
+use crate::net::{port_from_str, Net, PortForward};
 use crate::project::{ensure_project_root, project_dir};
 use crate::sandbox::Bind;
 use std::ffi::OsString;
@@ -496,6 +496,46 @@ pub(crate) fn read_tup_config(project: &str) -> TupConfig {
         persist,
         binds,
         ssh_agent_key,
+    }
+}
+
+/// Read the flake's `outputs.tup.ports` — port forwards (pasta only). Each entry is
+/// `{ proto; host; container; }` with `proto` optional ("tcp"). Mirrors `read_tup_config`'s
+/// bind reader: emit one `proto\thost\tcontainer` line per entry via `nix eval --apply`, then
+/// parse. A project with no flake (or no `ports` stanza) yields an empty list.
+pub(crate) fn read_ports(project: &str) -> Vec<PortForward> {
+    if !is_nix_project(project) {
+        return Vec::new();
+    }
+    let flakeref = env_dir(project).display().to_string();
+    // `toString` renders the integer ports; `proto or "tcp"` supplies the default.
+    let apply = r#"c: builtins.concatStringsSep "\n" (map (p: "${p.proto or "tcp"}\t${toString p.host}\t${toString p.container}") (c.ports or []))"#;
+    match nix_eval_tup(&flakeref, apply) {
+        Ok(out) => {
+            let mut v = Vec::new();
+            for line in out.lines().filter(|l| !l.trim().is_empty()) {
+                let parts: Vec<&str> = line.splitn(3, '\t').collect();
+                // Reconstruct a `proto:host:container` spec and reuse the CLI parser so the flake
+                // and `--port` validate identically.
+                let spec = if parts.len() == 3 {
+                    Some(format!("{}:{}:{}", parts[0], parts[1], parts[2]))
+                } else {
+                    None
+                };
+                match spec.as_deref().map(port_from_str) {
+                    Some(Ok(pf)) => v.push(pf),
+                    Some(Err(e)) => {
+                        eprintln!("[tup] warning: dropping malformed tup.ports entry {line:?}: {e}")
+                    }
+                    None => eprintln!("[tup] warning: dropping malformed tup.ports entry {line:?}"),
+                }
+            }
+            v
+        }
+        Err(e) => {
+            warn_tup("ports", &e);
+            Vec::new()
+        }
     }
 }
 

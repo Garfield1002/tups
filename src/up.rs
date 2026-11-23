@@ -1,9 +1,9 @@
 //! `tup up` — launch a PID-1 supervised container (host side) and shepherd its shutdown.
 
-use crate::net::{net_from_str, write_net, Net};
+use crate::net::{net_from_str, port_from_str, write_net, Net, PortForward};
 use crate::nixenv::{self, env_mode_from_str, EnvMode};
 use crate::project::{ensure_project_root, project_dir};
-use crate::sandbox::{launch, Bind, Spec, AGENT_SOCK, GATE_SOCK};
+use crate::sandbox::{launch, map_from_str, Bind, Spec, AGENT_SOCK, GATE_SOCK};
 use crate::{agent, agent::Agent, gate, gate::Gate};
 use std::env;
 use std::ffi::OsString;
@@ -97,6 +97,8 @@ pub(crate) fn cmd_up(args: &[String]) {
     let mut net_explicit = false;
     let mut harden = false;
     let mut env = EnvMode::Host;
+    let mut cli_binds: Vec<Bind> = Vec::new();
+    let mut ports: Vec<PortForward> = Vec::new();
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -114,6 +116,53 @@ pub(crate) fn cmd_up(args: &[String]) {
                 harden = true;
                 i += 1;
             }
+            "--bind" | "--ro-bind" => {
+                let ro = args[i] == "--ro-bind";
+                match args.get(i + 1) {
+                    Some(p) => cli_binds.push(Bind {
+                        src: p.into(),
+                        dst: p.into(),
+                        ro,
+                    }),
+                    None => {
+                        eprintln!("tup: {} needs a path", args[i]);
+                        exit(2);
+                    }
+                }
+                i += 2;
+            }
+            "--map" => {
+                match args.get(i + 1) {
+                    Some(s) => match map_from_str(s) {
+                        Ok(b) => cli_binds.push(b),
+                        Err(e) => {
+                            eprintln!("tup: --map: {e}");
+                            exit(2);
+                        }
+                    },
+                    None => {
+                        eprintln!("tup: --map needs HOST:CONTAINER[:ro]");
+                        exit(2);
+                    }
+                }
+                i += 2;
+            }
+            "--port" => {
+                match args.get(i + 1) {
+                    Some(s) => match port_from_str(s) {
+                        Ok(p) => ports.push(p),
+                        Err(e) => {
+                            eprintln!("tup: --port: {e}");
+                            exit(2);
+                        }
+                    },
+                    None => {
+                        eprintln!("tup: --port needs [tcp|udp:]HOST:CONTAINER");
+                        exit(2);
+                    }
+                }
+                i += 2;
+            }
             _ => {
                 rest.push(args[i].clone());
                 i += 1;
@@ -121,7 +170,7 @@ pub(crate) fn cmd_up(args: &[String]) {
         }
     }
     if rest.is_empty() {
-        eprintln!("usage: tup up [--net pasta|host|none] [--env host|nix] [--harden] <project>");
+        eprintln!("usage: tup up [--net pasta|host|none] [--env host|nix] [--harden] [--bind P] [--ro-bind P] [--map H:C[:ro]] [--port [tcp|udp:]H:C] <project>");
         exit(2);
     }
     let project = rest[0].clone();
@@ -145,6 +194,8 @@ pub(crate) fn cmd_up(args: &[String]) {
             }
             tup_binds = nixenv::persist_binds(&project, &cfg.persist);
             tup_binds.extend(cfg.binds);
+            // Flake-declared port forwards (outputs.tup.ports), merged with any `--port` flags.
+            ports.extend(nixenv::read_ports(&project));
             // Credential agent (outputs.tup.agents.ssh): forward the socket, never the key.
             if let Some(name) = &cfg.ssh_agent_key {
                 match agent::setup(name, &project) {
@@ -198,6 +249,17 @@ pub(crate) fn cmd_up(args: &[String]) {
         });
     }
     extra.extend(tup_binds); // host binds declared in the flake's `tup` output
+    extra.extend(cli_binds); // --bind/--ro-bind/--map from the CLI
+    // Port forwarding needs pasta's own netns; --net host shares the host's ports already and
+    // --net none has no egress. Warn and drop so the Spec reflects what will actually happen.
+    if !ports.is_empty() && net != Net::Pasta {
+        eprintln!(
+            "[tup] warning: ignoring {} --port/flake port forward(s): port forwarding needs --net pasta (have --net {})",
+            ports.len(),
+            net.label()
+        );
+        ports.clear();
+    }
     let inner: Vec<OsString> = ["/run/tup", "init", &project]
         .iter()
         .map(OsString::from)
@@ -214,6 +276,7 @@ pub(crate) fn cmd_up(args: &[String]) {
         profile,
         forward_agent,
         extra,
+        ports,
         inner,
     };
     let mut c = launch(spec);

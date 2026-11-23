@@ -1,9 +1,9 @@
 //! `tup run` — one-shot command in a project's namespace.
 
-use crate::net::{net_from_str, Net};
+use crate::net::{net_from_str, port_from_str, Net, PortForward};
 use crate::nixenv::{self, env_mode_from_str, EnvMode};
 use crate::project::ensure_project_root;
-use crate::sandbox::{launch, Bind, Spec, AGENT_SOCK, GATE_SOCK};
+use crate::sandbox::{launch, map_from_str, Bind, Spec, AGENT_SOCK, GATE_SOCK};
 use crate::{agent, agent::Agent, gate, gate::Gate};
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -21,6 +21,7 @@ pub(crate) fn cmd_run(args: &[String]) {
     let mut harden = false;
     let mut env = EnvMode::Host;
     let mut extra: Vec<Bind> = Vec::new();
+    let mut ports: Vec<PortForward> = Vec::new();
     let mut project: Option<String> = None;
     let mut i = 0;
     while i < opts.len() {
@@ -53,6 +54,38 @@ pub(crate) fn cmd_run(args: &[String]) {
                 }
                 i += 2;
             }
+            "--map" => {
+                match opts.get(i + 1) {
+                    Some(s) => match map_from_str(s) {
+                        Ok(b) => extra.push(b),
+                        Err(e) => {
+                            eprintln!("tup: --map: {e}");
+                            exit(2);
+                        }
+                    },
+                    None => {
+                        eprintln!("tup: --map needs HOST:CONTAINER[:ro]");
+                        exit(2);
+                    }
+                }
+                i += 2;
+            }
+            "--port" => {
+                match opts.get(i + 1) {
+                    Some(s) => match port_from_str(s) {
+                        Ok(p) => ports.push(p),
+                        Err(e) => {
+                            eprintln!("tup: --port: {e}");
+                            exit(2);
+                        }
+                    },
+                    None => {
+                        eprintln!("tup: --port needs [tcp|udp:]HOST:CONTAINER");
+                        exit(2);
+                    }
+                }
+                i += 2;
+            }
             "--chdir" => {
                 chdir = opts.get(i + 1).cloned();
                 if chdir.is_none() {
@@ -75,7 +108,7 @@ pub(crate) fn cmd_run(args: &[String]) {
     let project = match project {
         Some(p) => p,
         None => {
-            eprintln!("usage: tup run [--net M] [--env host|nix] [--harden] [--bind P] [--ro-bind P] [--chdir P] <project> [-- <cmd>]");
+            eprintln!("usage: tup run [--net M] [--env host|nix] [--harden] [--bind P] [--ro-bind P] [--map H:C[:ro]] [--port [tcp|udp:]H:C] [--chdir P] <project> [-- <cmd>]");
             exit(2);
         }
     };
@@ -101,6 +134,8 @@ pub(crate) fn cmd_run(args: &[String]) {
             }
             extra.extend(nixenv::persist_binds(&project, &cfg.persist));
             extra.extend(cfg.binds);
+            // Flake-declared port forwards (outputs.tup.ports), merged with any `--port` flags.
+            ports.extend(nixenv::read_ports(&project));
             // Credential agent (outputs.tup.agents.ssh): forward the socket, never the key.
             if let Some(name) = &cfg.ssh_agent_key {
                 match agent::setup(name, &project) {
@@ -140,6 +175,17 @@ pub(crate) fn cmd_run(args: &[String]) {
         cmd.iter().map(OsString::from).collect()
     };
 
+    // Port forwarding needs pasta's own netns; --net host already shares the host's ports and
+    // --net none has no egress. Warn and drop so the Spec reflects what will actually happen.
+    if !ports.is_empty() && net != Net::Pasta {
+        eprintln!(
+            "[tup] warning: ignoring {} --port/flake port forward(s): port forwarding needs --net pasta (have --net {})",
+            ports.len(),
+            net.label()
+        );
+        ports.clear();
+    }
+
     eprintln!(
         "[tup] run project={project} net={} env={} chdir={chdir}{}",
         net.label(),
@@ -157,6 +203,7 @@ pub(crate) fn cmd_run(args: &[String]) {
         profile,
         forward_agent,
         extra,
+        ports,
         inner,
     };
     let mut c = launch(spec);

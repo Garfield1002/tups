@@ -254,6 +254,33 @@ Everything except the move round-trip is assembling known-good parts. Prove the 
    *(pieces 1–4 done: hermetic `--env nix` — flake → profile → PATH is just the profile, host
    /usr dropped; prologues (base + opt-in languages, `tup env`); `outputs.tup` net/persist/binds;
    `tup move` ships the flake + `nix copy`s the closure by hash and restores persist volumes.)*
+8. **First-class features iteration (2026-11-24)** — making the discussed capabilities real:
+   - *Nix zero-config.* `src/detect.rs` infers prologues from working-tree markers
+     (`Cargo.toml`→rust, `package.json`→node, `pyproject.toml`/`requirements.txt`→python,
+     `go.mod`→go, `lean-toolchain`→lean). `tup run/up --env nix` auto-activates them when the
+     selection is still the untouched `[base]`; `tup env <p> detect` applies it explicitly.
+     Verified end-to-end: rust, node, python each run hermetically with no hand-written Nix.
+   - *Escape hatches.* `--map HOST:CONTAINER[:ro]` (distinct-path binds) and `--port
+     [tcp|udp:]HOST:CONTAINER` (pasta forwarding) on both `run` and `up`; `outputs.tup.ports`
+     in the flake; `-e KEY=VAL` env injection and `-w/--workdir`. Port forwarding needs
+     `--net pasta` (warned+ignored otherwise).
+   - *Gates generalised.* Beyond the built-in git gate, `outputs.tup.gates.<name>` may declare a
+     `kind = "command"` gate: the host runs a fixed, flake-authored program with an
+     arg-allowlist (exactly one arg, exact match, no option-injection, no shell, cleaned env),
+     the container holding only a per-gate socket under `/run/tup-gates/`. Driven with
+     `tup gate <name> <arg>`; `tup push`/`tup fetch` remain the git-gate aliases.
+   - *Move rebuild-vs-rsync dial.* Remote moves leave derived/cache dirs (`target/`,
+     `node_modules/`, `.venv/`, `__pycache__/`, `dist/`, …) out of the rsync payload so the
+     target rebuilds/refetches them; `outputs.tup.move.{ship,rebuild}` overrides per path and
+     `tup move --ship-all` sends everything. Local moves still ship whole (hardlinked, free).
+     `tup preflight` reports the excluded patterns and the bytes kept off the wire. This
+     implements the Q3 "infer by default, manifest overrides" decision.
+   - *Transactional move.* `tup move` now stages every component beside its live path, swaps
+     atomically, confirms the target resumed, and only then drops the parked copies; any failure
+     past the quiesce restores the destination and restarts the source (preconditions run before
+     the quiesce, so a busy/taken target never interrupts the agent).
+   - *Docker-parity verbs.* `tup cp` (copy files in/out of the working tree) and `tup logs`
+     (a detached session's log); see `DOCKER_PARITY.md` for the full comparison.
 
 ## Decision log (what the grilling settled)
 

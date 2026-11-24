@@ -53,16 +53,23 @@ Optional, per feature: `pasta` (for `--net pasta`), `nsenter` (for `tup attach`)
 
 | Command | What it does |
 |---|---|
-| `tup run [--net M] [--env E] [--harden] <project> [-- <cmd>]` | Run one command in a fresh namespace. |
-| `tup up <project>` | Launch a PID-1 supervised container that starts declared services. |
+| `tup run [flags] <project> [-- <cmd>]` | Run one command in a fresh namespace. |
+| `tup up [flags] <project>` | Launch a PID-1 supervised container that starts declared services. |
 | `tup ps` | List projects: state, PID, net mode, env, service count. |
 | `tup attach <project> [-- <cmd>]` | Join a running container (a shell by default). |
 | `tup stop <project>` | Cleanly stop a running project. Idempotent. |
 | `tup rm [--force] <project>` | Delete a project's state. Dry-run unless `--force`. |
-| `tup env <project> [list\|add <p>\|rm <p>]` | Inspect/edit the Nix env's prologue selection. |
-| `tup move <project> <dest>` | Migrate a session to an `ssh` target. |
+| `tup cp <src> <dst>` | Copy files in/out of the working tree (`<project>:<path>` ⇄ host). |
+| `tup logs <project> [-f]` | Show (or follow) a detached session's log. |
+| `tup env <project> [list\|add <p>\|rm <p>\|detect]` | Inspect/edit the Nix prologue selection; `detect` infers it from the tree. |
+| `tup move [--ship-all] <project> <dest>` | Migrate a session to a `local:<name>` or `ssh` target. |
 | `tup preflight <project>` | Report what a move will cost before doing it. |
-| `tup push [<ref>]` / `tup fetch [<ref>]` | Drive the project's git gate (the host does the op). |
+| `tup gate <name> [args]` | Drive a declared gate; `tup push`/`tup fetch` are the git-gate aliases. |
+
+Shared `run`/`up` flags: `--net pasta\|host\|none`, `--env host\|nix`, `--harden`,
+`--bind P` / `--ro-bind P` (same-path), `--map HOST:CONTAINER[:ro]` (distinct paths),
+`--port [tcp\|udp:]HOST:CONTAINER` (pasta forwarding), `-e KEY=VAL` (env injection),
+`-w`/`--workdir P`.
 
 ### Networking
 
@@ -75,18 +82,23 @@ a `tup move` restores it — a `--net none` session is never silently re-opened 
 `--env host` *(default)* inherits the host `/usr` and `/etc`. `--env nix` is **hermetic**: the
 project's `flake.nix` *is* the environment — host `/usr` is dropped and `PATH` is just the
 flake profile's `bin`. The closure already lives in the shared `/nix/store`, so realizing it
-copies nothing. Compose it from reusable **prologues** (`tup env web add rust`), and declare
-the things a flake can't model as plain data in `outputs.tup`:
+copies nothing. It's **zero-config** for common stacks: drop a Rust/Python/JS project in and
+`tup run --env nix <project>` auto-detects the language (`Cargo.toml`→rust, `package.json`→node,
+`pyproject.toml`→python, …) and activates the matching prologue. Customize with
+`tup env web add rust` (or `tup env web detect`), and declare the things a flake can't model as
+plain data in `outputs.tup`:
 
 ```nix
 tup = {
   net     = "pasta";
-  persist = [ "/var/lib/postgresql" ];               # rw dirs that survive teardown + ride a move
-  binds   = [ { path = "/etc/hosts"; ro = true; } ];  # host files to link in
+  persist = [ "/var/lib/postgresql" ];                # rw dirs that survive teardown + ride a move
+  binds   = [ { host = "/data"; path = "/data"; ro = true; } ];  # host files/dirs to link in
+  ports   = [ { proto = "tcp"; host = 8080; container = 3000; } ];  # pasta forward (like -p)
   gates.git = {                                       # see below
     remote = "git@github.com:you/repo.git";
     allow  = [ "push" "fetch" ];
   };
+  move = { rebuild = [ "/work/node_modules" ]; };     # keep derived dirs off the wire on a move
 };
 ```
 
@@ -102,6 +114,17 @@ itself with its own credentials. Inside the box the agent runs `tup push main`; 
 checks *operation allowed? ref allowed? no option injection?* and then runs `git push` to the
 one remote the policy names. Nothing — not a key, not a token — ever enters the container, and
 it can do *only* the declared operation to the declared remote.
+
+Gates are extensible. Besides the built-in `git` gate, you can declare a **command gate** — a
+fixed, flake-authored host program the container may invoke with an allowlisted argument and
+nothing else (no shell, no option injection, the program and its cwd fixed by the policy):
+
+```nix
+gates.deploy = { kind = "command"; run = "/opt/bin/deploy"; allow = [ "staging" "prod" ]; };
+```
+
+Inside the container, `tup gate deploy staging` runs the host's `deploy staging` and relays the
+result — the container never learns how deploy authenticates.
 
 **Agents** forward a *socket to a host `ssh-agent`*, not the key. `agents.ssh.key = "<name>"`
 runs a dedicated agent holding a tup-managed, repo-scoped deploy key; inside the container,

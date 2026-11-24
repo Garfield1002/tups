@@ -36,8 +36,8 @@ Status legend: ✅ exists · 🟡 partial · 🔭 portable-future (fits the mode
 | `docker exec` | `tup attach <p> [-- cmd]` — `nsenter`s into the live container's user/mount/uts/ipc/pid(/net) namespaces; clean per-env PATH; defaults to `/bin/sh`. | ✅ | Under `--net pasta` the attached shell shares the host net (pasta's netns isn't enterable from the inner userns); noted at attach time. |
 | `docker cp` | **`tup cp <src> <dst>`** — one side is `<project>:<path>`. The `<project>:` side resolves under the writable root (`~/.tup/<p>/root`, the container's `/work`): relative → relative to `/work`, absolute must be under `/work`. Files and dirs (recursive); parents created on copy-in; `..`-escape and out-of-`/work` paths refused. | ✅ (**new tonight**) | Addresses the working tree directly on the host — no running container needed. |
 | `docker logs [-f]` | **`tup logs [-f] <project>`** — prints `~/.tup/<p>/up.log` (what a *detached* `tup up`/`tup move` session and its services write); `-f` follows by polling. | 🟡 (**new tonight**) | A *foreground* `tup run`/`tup up` writes straight to your terminal, not a file — `logs` says so when there's no log. No per-service log demux (all services share the supervisor's stdout → `up.log`). |
-| `-e KEY=VAL` (env vars) | — the env is the flake; packages & their env come from the profile. No per-run env-var injection flag today. | 🔭 | ⚠️ **Name clash:** tups' `--env` means *env mode* (`host`\|`nix`), not an env var. A small `--env-var K=V`/`outputs.tup.env` would fit. |
-| `-w` / `--workdir` | `tup run --chdir <path>`. | 🟡 | `run` only; `up` and `attach` fix the cwd to `/work`. |
+| `-e KEY=VAL` (env vars) | **`-e KEY=VAL` / `--env-var`** on `run` and `up` (repeatable); applied after the built-in env so an explicit value wins, and carried across the pyrex re-exec. | ✅ (**new tonight**) | Named `-e`/`--env-var` to avoid the clash with `--env` (env *mode*: host\|nix). |
+| `-w` / `--workdir` | **`-w` / `--workdir <path>`** on `run` and `up` (`run` also keeps `--chdir`). | ✅ (**new tonight**) | `attach` still fixes cwd to `/work`. |
 | `-p` / `--publish` | `--port [tcp\|udp:]HOST:CONTAINER` (CLI) and `outputs.tup.ports = [{ proto; host; container; }]`. | ✅ | pasta only — `--net host` already shares ports, `--net none` has no egress; a port on a non-pasta net is dropped with a warning. |
 | `-v` / `--volume` (binds) | `--bind P` / `--ro-bind P` (same path in/out), `--map HOST:CONTAINER[:ro]` (distinct), and `outputs.tup.binds = [{ host; path; ro; }]`. | ✅ | `ro` is the default posture; `rw` is opt-in (typed-links model). |
 | `-v` named volumes | `outputs.tup.persist = [ "/state" ]` — rw dirs backed by `~/.tup/<p>/persist/<slug>`, bound rw, that **survive turns and ride the move payload**. | 🟡 (different model) | Persist volumes are move-aware, not a global named-volume registry; no `docker volume create/ls/prune`. |
@@ -46,11 +46,11 @@ Status legend: ✅ exists · 🟡 partial · 🔭 portable-future (fits the mode
 | `docker stop` | `tup stop <p>` — SIGTERM to PID 1 so `init` runs quiesce (stop hooks, then bounded TERM→KILL sweep), then waits; idempotent. | ✅ | |
 | `docker start` | `tup up <p>` (re-launch). | 🟡 | No separate `start` verb; `up` is launch. |
 | `docker restart` | stop + `up` (two verbs). | 🔭 | A one-shot `tup restart` would be a thin wrapper. |
-| `--restart` policy | — the supervisor **reaps** services and exits when all have exited; it does **not** respawn a crashed service. | 🔭 | Honest gap: an `outputs.tup` restart policy (`on-failure`/`always`) is a clean future addition in `init`. |
+| `--restart` policy | **`restart <name> no\|on-failure\|always`** in the service manifest; `init` respawns the service per policy, capped at 5 restarts / 10s so a crash-loop can't spin forever (then it gives up). | ✅ (**new tonight**) | Default `no` preserves the original reap-and-exit behaviour exactly. |
 | `HEALTHCHECK` | — services declare `start`/`stop` hooks only; no health probe or health-gated readiness. | 🔭 | Fits as an `outputs.tup` service field + a probe loop in `init`. |
 | networks (`docker network`) | Per-project **netns**: `--net pasta` (default; own loopback, NAT egress via pasta), `--net host`, `--net none`. Addresses are **move-invariant** (a service is `127.0.0.1:3000` on every host). Inter-project sharing is a typed **tup-project link** (a declared output of the producer), not a shared bridge. | 🟡 (different model) | Sibling isolation + move-invariance by design; egress is wide open by design (agent needs model API + mirrors), so no network policy, no user-defined bridges/overlays. |
 | `--memory` / `--cpus` | — not shipped. `DESIGN.md` plans it via `systemd-run --scope -p MemoryMax/TasksMax` (cleaner than raw cgroup v2 writes under the no-internal-processes rule). | 🔭 | Depends on the target's systemd/delegation; deliberately not shipped blind. |
-| `docker inspect` | `tup ps` lists every project with state/pid/net/env-mode/service-count. No single-object JSON dump. | 🟡 | A `tup inspect <p>` (flake config + binds + ports + persist as JSON) is a natural next verb. |
+| `docker inspect` | **`tup inspect <p>`** dumps the resolved config (state, pid, net, env/prologues, binds, ports, gates, persist, move dial, services); `tup ps` lists all projects. | ✅ (**new tonight**) | Human-readable rather than JSON; a `--json` mode would be a small add. |
 | `docker commit` | — no mutable image to freeze. The env is a flake by hash; "capture current state" = commit the flake / working tree, which is already content-addressed and movable. | ⛔ (out-of-model) | Committing a mutated rootfs would defeat the by-hash dedup/move guarantees. |
 | `docker pause` / `unpause` | — no freeze. Migration is **between-turn**, not a CRIU/RAM freeze (a coding agent's safe point is "idle between turns"). | ⛔ (out-of-model) | `tup move`'s quiesce is the closest thing, but it stops cleanly rather than freezing. |
 | labels | — none. | 🔭 | `outputs.tup.labels` + a column in `ps` would be trivial and fit the plain-data output. |
@@ -77,25 +77,25 @@ Status legend: ✅ exists · 🟡 partial · 🔭 portable-future (fits the mode
   `up.log`; `-f` follows by polling for appended bytes (Ctrl-C-able, and tolerant of a closed
   pipe). When there's no log it explains that a foreground `tup run`/`tup up` writes to the
   terminal, not a file.
+- **`-e KEY=VAL` / `--env-var`** on `run` and `up` — env-var injection (the Docker `-e`),
+  applied after the built-in env and carried across the pyrex re-exec via `--set-env`.
+- **`-w` / `--workdir`** on `run` and `up` — set the container working directory.
+- **`restart <name> no|on-failure|always`** service directive — `init` respawns per policy with
+  a crash-loop cap; default `no` is the original behaviour.
+- **`tup inspect <p>`** — a readable dump of a project's resolved configuration.
 - This doc.
 
 ## Worth porting next (prioritized)
 
-1. **`--restart` policy for services** (`outputs.tup` field + respawn in `init`). The current
-   "reap and exit when all services exit" is the single most surprising gap vs. Docker, and
-   `init` already owns the process tree — this is where it most naturally lives.
-2. **`tup inspect <p>`** — one JSON view of a project (flake config, binds, ports, persist,
-   net, pid, services). Cheap (the data is already read by `run`/`up`), and the obvious
-   companion to `ps`; also unblocks tooling/automation.
-3. **Per-run/flake env vars** (`--env-var K=V` + `outputs.tup.env`) — resolve the `--env`
-   name clash by naming the new flag clearly. Common enough (`DATABASE_URL`, `RUST_LOG`) that
-   its absence is felt immediately.
-4. **`HEALTHCHECK`-style service probes** (`outputs.tup` field + a probe loop in `init`;
-   health-gate readiness and move quiesce). Pairs with #1.
-5. **Resource limits** (`--memory`/`--cpus` via `systemd-run --scope`). Already scoped in
+1. **`HEALTHCHECK`-style service probes** (`outputs.tup` service field + a probe loop in
+   `init`; health-gate readiness and the move quiesce). Pairs with the restart policy now in
+   place.
+2. **Resource limits** (`--memory`/`--cpus` via `systemd-run --scope`). Already scoped in
    `DESIGN.md`; the real blast-radius win for a runaway agent (DoS is explicitly *not*
    contained today).
-6. **`tup restart`** and a **`tup start`** alias — thin ergonomic wrappers over stop+`up`.
-7. **`outputs.tup.labels`** + a `ps` column — trivial, and useful once there are many
+3. **`outputs.tup.env`** — declare env vars in the flake (the complement to the `-e` CLI flag),
+   so a project's environment travels with it on a move.
+4. **`tup restart`** and a **`tup start`** alias — thin ergonomic wrappers over stop+`up`.
+5. **`outputs.tup.labels`** + a `ps` column — trivial, and useful once there are many
    projects/fleets.
-8. **`--workdir` on `up`/`attach`** — `--chdir` exists for `run`; extend it for symmetry.
+6. **`tup inspect --json`** and **`--workdir` on `attach`** — small ergonomic/tooling rounding-out.

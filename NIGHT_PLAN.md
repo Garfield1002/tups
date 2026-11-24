@@ -19,13 +19,15 @@ userns on, egress ok, /nix/store 97G (rust cached). Rust build PATH:
 - [x] **D — Move rebuild-vs-rsync dial** (merged 10b232c): default derived-dir excludes,
       flake `outputs.tup.move.{ship,rebuild}`, `--ship-all`, preflight reporting.
 - [x] **E — Examples** (80eeaa0): examples/{rust,python,node} + README, all verified.
-- [~] **F — Docker parity**: comparison doc + tup cp / tup logs (subagent) + -e env vars +
-      --workdir on up (orchestrator). IN PROGRESS.
-- [ ] **G — Docs + report**: DESIGN.md, README, final summary.
+- [x] **F — Docker parity** (merged + extended): DOCKER_PARITY.md; `tup cp`, `tup logs`,
+      `-e KEY=VAL`, `-w/--workdir`, service `restart` policy, `tup inspect`. All verified.
+- [x] **G — Docs**: DESIGN.md increment 8, README, DOCKER_PARITY.md.
 
-Integrated state on `overnight`: 66 unit + 3 integration tests, clippy clean.
+Final state on `overnight`: 76 unit + 3 integration tests, clippy clean. All features
+verified at runtime (3 languages, ports, gates, move dial, move rollback, restart, cp/logs).
 Known follow-up: using a gate from inside a container needs the `tup` binary on the
 container PATH (fine in `up` via /run/tup but not on PATH; not bound in `run`).
+Branch not pushed — left for review.
 
 ## Conventions for parallel safety (to minimise nixenv.rs / run.rs / up.rs conflicts)
 - Each stream adds its config reader as a NEW `pub fn read_<x>(project)` in nixenv.rs

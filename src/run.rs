@@ -22,6 +22,7 @@ pub(crate) fn cmd_run(args: &[String]) {
     let mut env = EnvMode::Host;
     let mut extra: Vec<Bind> = Vec::new();
     let mut ports: Vec<PortForward> = Vec::new();
+    let mut extra_env: Vec<(String, String)> = Vec::new();
     let mut project: Option<String> = None;
     let mut i = 0;
     while i < opts.len() {
@@ -86,10 +87,20 @@ pub(crate) fn cmd_run(args: &[String]) {
                 }
                 i += 2;
             }
-            "--chdir" => {
+            "-e" | "--env-var" => {
+                match opts.get(i + 1).and_then(|kv| kv.split_once('=')) {
+                    Some((k, v)) if !k.is_empty() => extra_env.push((k.to_string(), v.to_string())),
+                    _ => {
+                        eprintln!("tup: {} needs KEY=VALUE", opts[i]);
+                        exit(2);
+                    }
+                }
+                i += 2;
+            }
+            "--chdir" | "--workdir" | "-w" => {
                 chdir = opts.get(i + 1).cloned();
                 if chdir.is_none() {
-                    eprintln!("tup: --chdir needs a path");
+                    eprintln!("tup: {} needs a path", opts[i]);
                     exit(2);
                 }
                 i += 2;
@@ -108,7 +119,7 @@ pub(crate) fn cmd_run(args: &[String]) {
     let project = match project {
         Some(p) => p,
         None => {
-            eprintln!("usage: tup run [--net M] [--env host|nix] [--harden] [--bind P] [--ro-bind P] [--map H:C[:ro]] [--port [tcp|udp:]H:C] [--chdir P] <project> [-- <cmd>]");
+            eprintln!("usage: tup run [--net M] [--env host|nix] [--harden] [--bind P] [--ro-bind P] [--map H:C[:ro]] [--port [tcp|udp:]H:C] [-e KEY=VAL] [--chdir/-w P] <project> [-- <cmd>]");
             exit(2);
         }
     };
@@ -211,6 +222,7 @@ pub(crate) fn cmd_run(args: &[String]) {
         forward_agent,
         extra,
         ports,
+        extra_env,
         inner,
     };
     let mut c = launch(spec);

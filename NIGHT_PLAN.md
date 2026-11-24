@@ -10,20 +10,22 @@ userns on, egress ok, /nix/store 97G (rust cached). Rust build PATH:
 
 ## Streams
 - [x] **move rollback** (done, commit 4862253) — transactional stage→swap→confirm→commit.
-- [ ] **A — Nix first-class / zero-config** (branch `overnight-nix`): detect rust/python/js
-      from marker files, auto-select prologues, examples that run with `--env nix`.
-- [ ] **B — Escape hatches** (branch `overnight-escape`): local maps (`--map host:ctr`),
-      port forwarding (`--port`), both on `run` + `up`, flake `outputs.tup.ports`.
-- [ ] **C — Gates first-class** (branch `overnight-gates`): generalise beyond git —
-      named gates, a generic command gate with arg allowlist, common built-ins, per-gate
-      sockets, `tup gate <name>` driver (keep `tup push`/`fetch`).
-- [ ] **D — Move rebuild-vs-rsync dial** (orchestrator, in migrate.rs): default-exclude
-      derived/cache dirs (target/, node_modules/, .venv/…), flake `outputs.tup.move`
-      override, preflight reporting, `--ship-all`.
-- [ ] **E — Examples** (orchestrator): examples/{rust,python,node}, verified end to end.
-- [ ] **F — Docker parity** (late): comparison doc + port high-value features
-      (tup cp, -e env vars, tup logs, service restart policy, workdir on up).
+- [x] **A — Nix first-class / zero-config** (merged): detect.rs infers prologues; auto-activate
+      on `--env nix`; `tup env detect`. VERIFIED end-to-end: rust, node, python all run.
+- [x] **B — Escape hatches** (merged 85265aa): `--map host:ctr[:ro]`, `--port [proto:]h:c`
+      on run+up, flake `outputs.tup.ports`. e2e port-forward + map verified by subagent.
+- [x] **C — Gates first-class** (merged 7cc0f3c): GateSpec/GateKind, command gates with arg
+      allowlist, per-gate sockets under GATE_DIR, `tup gate <name>` driver, push/fetch kept.
+- [x] **D — Move rebuild-vs-rsync dial** (merged 10b232c): default derived-dir excludes,
+      flake `outputs.tup.move.{ship,rebuild}`, `--ship-all`, preflight reporting.
+- [x] **E — Examples** (80eeaa0): examples/{rust,python,node} + README, all verified.
+- [~] **F — Docker parity**: comparison doc + tup cp / tup logs (subagent) + -e env vars +
+      --workdir on up (orchestrator). IN PROGRESS.
 - [ ] **G — Docs + report**: DESIGN.md, README, final summary.
+
+Integrated state on `overnight`: 66 unit + 3 integration tests, clippy clean.
+Known follow-up: using a gate from inside a container needs the `tup` binary on the
+container PATH (fine in `up` via /run/tup but not on PATH; not bound in `run`).
 
 ## Conventions for parallel safety (to minimise nixenv.rs / run.rs / up.rs conflicts)
 - Each stream adds its config reader as a NEW `pub fn read_<x>(project)` in nixenv.rs

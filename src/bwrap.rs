@@ -59,6 +59,10 @@ fn render(spec: &Spec) -> Vec<OsString> {
     for (k, v) in env_pairs(spec) {
         push3(&mut a, "--setenv", k, v);
     }
+    // User-injected env (`-e KEY=VAL`), after the built-ins so an explicit value wins.
+    for (k, v) in &spec.extra_env {
+        push3(&mut a, "--setenv", k.clone(), v.clone());
+    }
     // Opt-in hardening: drop all capabilities (empty cap set even on a namespace escape)
     // and start a new session (no TIOCSTI injection into the parent terminal).
     if spec.harden {

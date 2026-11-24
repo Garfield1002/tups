@@ -99,6 +99,8 @@ pub(crate) fn cmd_up(args: &[String]) {
     let mut env = EnvMode::Host;
     let mut cli_binds: Vec<Bind> = Vec::new();
     let mut ports: Vec<PortForward> = Vec::new();
+    let mut extra_env: Vec<(String, String)> = Vec::new();
+    let mut chdir = "/work".to_string();
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -163,6 +165,26 @@ pub(crate) fn cmd_up(args: &[String]) {
                 }
                 i += 2;
             }
+            "-e" | "--env-var" => {
+                match args.get(i + 1).and_then(|kv| kv.split_once('=')) {
+                    Some((k, v)) if !k.is_empty() => extra_env.push((k.to_string(), v.to_string())),
+                    _ => {
+                        eprintln!("tup: {} needs KEY=VALUE", args[i]);
+                        exit(2);
+                    }
+                }
+                i += 2;
+            }
+            "--workdir" | "-w" => {
+                match args.get(i + 1) {
+                    Some(p) => chdir = p.clone(),
+                    None => {
+                        eprintln!("tup: {} needs a path", args[i]);
+                        exit(2);
+                    }
+                }
+                i += 2;
+            }
             _ => {
                 rest.push(args[i].clone());
                 i += 1;
@@ -170,7 +192,7 @@ pub(crate) fn cmd_up(args: &[String]) {
         }
     }
     if rest.is_empty() {
-        eprintln!("usage: tup up [--net pasta|host|none] [--env host|nix] [--harden] [--bind P] [--ro-bind P] [--map H:C[:ro]] [--port [tcp|udp:]H:C] <project>");
+        eprintln!("usage: tup up [--net pasta|host|none] [--env host|nix] [--harden] [--bind P] [--ro-bind P] [--map H:C[:ro]] [--port [tcp|udp:]H:C] [-e KEY=VAL] [--workdir/-w P] <project>");
         exit(2);
     }
     let project = rest[0].clone();
@@ -276,7 +298,7 @@ pub(crate) fn cmd_up(args: &[String]) {
         root,
         project: project.clone(),
         net,
-        chdir: "/work".to_string(),
+        chdir,
         harden,
         as_pid1: true,
         env,
@@ -284,6 +306,7 @@ pub(crate) fn cmd_up(args: &[String]) {
         forward_agent,
         extra,
         ports,
+        extra_env,
         inner,
     };
     let mut c = launch(spec);

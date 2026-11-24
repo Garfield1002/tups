@@ -124,6 +124,11 @@ pub(crate) fn launch(spec: Spec) -> Command {
         a.push(b.src.clone().into_os_string());
         a.push(b.dst.clone().into_os_string());
     }
+    // User env (`-e KEY=VAL`) must cross the re-exec: the in-container side applies it.
+    for (k, v) in &spec.extra_env {
+        a.push("--set-env".into());
+        a.push(OsString::from(format!("{k}={v}")));
+    }
     a.push("--".into());
     a.extend(spec.inner.iter().cloned());
 
@@ -189,6 +194,10 @@ pub(crate) fn run_sandbox(args: &[OsString]) -> ! {
         }
     }
     for (k, v) in env_pairs(&spec) {
+        std::env::set_var(k, v);
+    }
+    // User-injected env (`-e KEY=VAL`), after the built-ins so an explicit value wins.
+    for (k, v) in &spec.extra_env {
         std::env::set_var(k, v);
     }
     if let Err(e) = std::env::set_current_dir(&spec.chdir) {
@@ -608,6 +617,7 @@ fn parse(args: &[OsString]) -> Spec {
     let mut env = EnvMode::Host;
     let mut profile: Option<PathBuf> = None;
     let mut extra: Vec<Bind> = Vec::new();
+    let mut extra_env: Vec<(String, String)> = Vec::new();
     let mut inner: Vec<OsString> = Vec::new();
     let mut i = 0;
     // Flag NAMES and the ascii-only values (project/net/chdir/env) match via to_str(); PATHS
@@ -662,6 +672,14 @@ fn parse(args: &[OsString]) -> Spec {
                 });
                 i += 3;
             }
+            Some("--set-env") => {
+                // `KEY=VAL`; split on the first '=' so values may contain '='.
+                let kv = req(args, i + 1, "--set-env").to_string_lossy().into_owned();
+                if let Some((k, v)) = kv.split_once('=') {
+                    extra_env.push((k.to_string(), v.to_string()));
+                }
+                i += 2;
+            }
             Some("--") => {
                 inner = args[i + 1..].to_vec();
                 break;
@@ -686,6 +704,7 @@ fn parse(args: &[OsString]) -> Spec {
         // Port forwards are a host-side pasta concern (applied by `wrap_pasta` before the
         // sandbox is entered); the in-container launcher never needs them.
         ports: Vec::new(),
+        extra_env,
         inner,
     }
 }

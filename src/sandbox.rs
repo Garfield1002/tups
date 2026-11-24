@@ -64,6 +64,9 @@ pub(crate) struct Spec {
     pub extra: Vec<Bind>,
     /// Port forwards to install in pasta (ignored for `Net::Host`/`Net::None`).
     pub ports: Vec<PortForward>,
+    /// Extra environment variables injected into the container (`-e KEY=VAL`), applied after the
+    /// built-in `env_pairs` so an explicit value wins. Carried across the pyrex re-exec.
+    pub extra_env: Vec<(String, String)>,
     pub inner: Vec<OsString>,
 }
 

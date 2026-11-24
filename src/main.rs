@@ -22,6 +22,7 @@ use std::process::exit;
 
 mod agent;
 mod bwrap;
+mod copyfile;
 mod detect;
 mod gate;
 #[cfg(feature = "pyrex")]
@@ -66,6 +67,8 @@ fn main() {
         "preflight" => migrate::cmd_preflight(&rest),
         "ps" => status::cmd_ps(&rest),
         "attach" => status::cmd_attach(&rest),
+        "logs" => status::cmd_logs(&rest),
+        "cp" => copyfile::cmd_cp(&rest),
         "stop" => status::cmd_stop(&rest),
         "rm" => status::cmd_rm(&rest),
         // Container-side git-gate aliases: ask the host gatekeeper to run the filtered op.
@@ -107,6 +110,8 @@ COMMANDS:
     up  [--net M] [--env E] [--harden] <project>              PID-1 supervisor     [implemented]
     env <project> [list|add <p>|rm <p>]             inspect/edit env prologues     [implemented]
     ps                                              list projects and their state  [implemented]
+    logs [-f] <project>                             show a session's up.log (-f: follow) [implemented]
+    cp <src> <dst>                     copy files host<->project tree (<project>:<path>) [implemented]
     stop <project>                                  clean-stop a running project   [implemented]
     rm [--force] <project>                          delete a project's state       [implemented]
     push [<ref>] / fetch [<ref>]       drive the project's git gate (host does the op) [implemented]

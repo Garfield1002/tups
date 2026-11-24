@@ -165,6 +165,75 @@ pub(crate) fn cmd_attach(args: &[String]) {
     }
 }
 
+/// `tup logs <project> [-f]` — print a session's log (like `docker logs`).
+///
+/// A detached `tup up`/`tup move` session (and the services its PID-1 supervisor shepherds)
+/// writes `~/.tup/<project>/up.log`. A *foreground* `tup run`/`tup up` writes to your terminal,
+/// not a file, so there is no log to show. `-f` follows the file by polling for appended bytes
+/// (Ctrl-C to stop).
+pub(crate) fn cmd_logs(args: &[String]) {
+    use std::io::{Read, Write};
+
+    let mut follow = false;
+    let mut name: Option<String> = None;
+    for a in args {
+        match a.as_str() {
+            "-f" | "--follow" => follow = true,
+            _ if name.is_none() => name = Some(a.clone()),
+            _ => {
+                eprintln!("tup: unexpected argument '{a}'");
+                exit(2);
+            }
+        }
+    }
+    let project = match name {
+        Some(p) => p,
+        None => {
+            eprintln!("usage: tup logs [-f] <project>");
+            exit(2);
+        }
+    };
+    crate::project::ensure_valid_name(&project);
+    let log = project_dir(&project).join("up.log");
+    let mut f = match fs::File::open(&log) {
+        Ok(f) => f,
+        Err(_) => {
+            println!(
+                "no log for '{project}' ({}).\n\
+                 a detached `tup up`/`tup move` session writes up.log; a foreground \
+                 `tup run`/`tup up` writes to your terminal, not a file.",
+                log.display()
+            );
+            return;
+        }
+    };
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut buf = [0u8; 8192];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => {
+                // Reached the current end of the file.
+                if !follow {
+                    break;
+                }
+                let _ = out.flush();
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Ok(n) => {
+                if out.write_all(&buf[..n]).is_err() {
+                    break; // pipe closed (e.g. `tup logs … | head`)
+                }
+            }
+            Err(e) => {
+                eprintln!("tup: read {}: {e}", log.display());
+                exit(1);
+            }
+        }
+    }
+    let _ = out.flush();
+}
+
 /// `tup stop <project>` — cleanly stop a running project. We SIGTERM the sandbox PID 1 so
 /// `tup init` runs its quiesce (stop hooks, then the bounded SIGTERM→SIGKILL sweep) — never
 /// the monitor, whose pdeathsig would SIGKILL the tree and skip quiesce. Then we wait for

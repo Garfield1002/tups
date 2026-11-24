@@ -234,6 +234,86 @@ pub(crate) fn cmd_logs(args: &[String]) {
     let _ = out.flush();
 }
 
+/// `tup inspect <project>` — a readable dump of a project's resolved configuration (like
+/// `docker inspect`, but human-oriented): state, net, env/prologues, binds, ports, gates,
+/// persist volumes, the move dial, and service count. Read-only.
+pub(crate) fn cmd_inspect(args: &[String]) {
+    let project = match args.first() {
+        Some(p) => p.clone(),
+        None => {
+            eprintln!("usage: tup inspect <project>");
+            exit(2);
+        }
+    };
+    crate::project::ensure_valid_name(&project);
+    let dir = project_dir(&project);
+    if !dir.join("root").is_dir() {
+        eprintln!("tup: no such project '{project}'");
+        exit(1);
+    }
+    let pid = find_init_pid(&project);
+    println!("project   : {project}");
+    println!(
+        "state     : {}",
+        if pid.is_some() { "running" } else { "stopped" }
+    );
+    if let Some(p) = pid {
+        println!("init pid  : {p}");
+    }
+    println!("root      : {}", dir.join("root").display());
+    println!(
+        "net       : {}",
+        if dir.join("net").exists() {
+            read_net_label(&project)
+        } else {
+            "- (pasta default on next up)".to_string()
+        }
+    );
+    let nix = nixenv::is_nix_project(&project);
+    println!("env       : {}", if nix { "nix (flake)" } else { "host /usr" });
+    if nix {
+        println!("prologues : {}", nixenv::read_active(&project).join(" "));
+        let cfg = nixenv::read_tup_config(&project);
+        if !cfg.persist.is_empty() {
+            let ps: Vec<String> = cfg.persist.iter().map(|p| p.display().to_string()).collect();
+            println!("persist   : {}", ps.join(" "));
+        }
+        for b in &cfg.binds {
+            println!(
+                "bind      : {} {} -> {}",
+                if b.ro { "ro" } else { "rw" },
+                b.src.display(),
+                b.dst.display()
+            );
+        }
+        for pf in nixenv::read_ports(&project) {
+            let proto = match pf.proto {
+                crate::net::Proto::Tcp => "tcp",
+                crate::net::Proto::Udp => "udp",
+            };
+            println!("port      : {proto} host:{} -> container:{}", pf.host, pf.container);
+        }
+        for g in nixenv::read_gates(&project) {
+            match &g.kind {
+                crate::gate::GateKind::Git(p) => {
+                    println!("gate      : {} = git -> {}", g.name, p.remote)
+                }
+                crate::gate::GateKind::Command { run, allow } => {
+                    println!("gate      : {} = command '{run}' [{}]", g.name, allow.join(","))
+                }
+            }
+        }
+        let mv = nixenv::read_move_policy(&project);
+        if !mv.ship.is_empty() {
+            println!("move.ship : {}", mv.ship.join(" "));
+        }
+        if !mv.rebuild.is_empty() {
+            println!("move.rebuild: {}", mv.rebuild.join(" "));
+        }
+    }
+    println!("services  : {}", service_count(&project));
+}
+
 /// `tup stop <project>` — cleanly stop a running project. We SIGTERM the sandbox PID 1 so
 /// `tup init` runs its quiesce (stop hooks, then the bounded SIGTERM→SIGKILL sweep) — never
 /// the monitor, whose pdeathsig would SIGKILL the tree and skip quiesce. Then we wait for

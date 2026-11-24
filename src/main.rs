@@ -66,6 +66,7 @@ fn main() {
         "move" => migrate::cmd_move(&rest),
         "preflight" => migrate::cmd_preflight(&rest),
         "ps" => status::cmd_ps(&rest),
+        "inspect" => status::cmd_inspect(&rest),
         "attach" => status::cmd_attach(&rest),
         "logs" => status::cmd_logs(&rest),
         "cp" => copyfile::cmd_cp(&rest),
@@ -106,41 +107,48 @@ USAGE:
     tup <command> [args]
 
 COMMANDS:
-    run [--net M] [--env E] [--harden] <project> [-- <cmd>]   run in a namespace   [implemented]
-    up  [--net M] [--env E] [--harden] <project>              PID-1 supervisor     [implemented]
-    env <project> [list|add <p>|rm <p>]             inspect/edit env prologues     [implemented]
-    ps                                              list projects and their state  [implemented]
-    logs [-f] <project>                             show a session's up.log (-f: follow) [implemented]
-    cp <src> <dst>                     copy files host<->project tree (<project>:<path>) [implemented]
-    stop <project>                                  clean-stop a running project   [implemented]
-    rm [--force] <project>                          delete a project's state       [implemented]
-    push [<ref>] / fetch [<ref>]       drive the project's git gate (host does the op) [implemented]
-    gate <name> [args…]                drive a named gate (git built-in or user-defined) [implemented]
-    gate serve --remote U --allow push --sock P [--tree D] [--refs R]  run a gatekeeper [implemented]
-    move <project> <dest>                           migrate a session              [implemented]
-    attach <project> [-- <cmd>]                     join a running container       [implemented]
-    preflight <project>                             report the cost/loss of a move [implemented]
+    run [flags] <project> [-- <cmd>]                run one command in a namespace
+    up  [flags] <project>                           PID-1 supervisor (declared services)
+    env <project> [list|add <p>|rm <p>|detect]      inspect/edit env prologues (detect: infer)
+    ps                                              list projects and their state
+    inspect <project>                               dump a project's resolved config
+    logs [-f] <project>                             show a session's up.log (-f: follow)
+    cp <src> <dst>                                  copy files host<->project tree (<project>:<path>)
+    attach <project> [-- <cmd>]                     join a running container
+    stop <project>                                  clean-stop a running project
+    rm [--force] <project>                          delete a project's state
+    move [--ship-all] <project> <local:<p>|host>    migrate a session
+    preflight <project>                             report the cost/loss of a move
+    push [<ref>] / fetch [<ref>]                    drive the git gate (host does the op)
+    gate <name> [args…]                             drive a named gate (git or user-defined command)
+    gate serve --remote U --allow push --sock P [--tree D] [--refs R]   standalone gatekeeper
     help | version
 
-    --net pasta  (default) dedicated netns, own loopback, NAT egress via pasta
-    --net host   share the host network namespace
-    --net none   isolated netns, loopback only, no egress
-    --env host   (default) inherit the host /usr + /etc
-    --env nix    hermetic: the project's flake IS the env; drop host /usr, PATH is the
-                 profile's bin. Composed from prologues (base + opt-in languages); the
-                 flake's `tup` output supplies net + host binds. Needs nix on PATH.
-    --harden     drop all capabilities (--cap-drop ALL) + new session (TTY-injection proof).
-                 We don't advertise security; this just lowers the escape stakes.
+RUN/UP FLAGS:
+    --net pasta|host|none   pasta (default): own netns + NAT egress; host: share; none: loopback-only
+    --env host|nix          host (default): inherit /usr+/etc; nix: hermetic flake env (auto-detects lang)
+    --bind P / --ro-bind P  bind a host path at the same container path (rw / ro)
+    --map HOST:CONTAINER[:ro]   bind a host path at a different container path
+    --port [tcp|udp:]H:C    forward host port H to container port C (pasta only)
+    -e KEY=VAL              inject an environment variable (repeatable)
+    -w, --workdir P         working directory inside the container (run also: --chdir)
+    --harden                --cap-drop ALL + new session (lowers escape stakes; not a sandbox)
+
+The hermetic env is the project's flake (`~/.tup/<p>/env/flake.nix`): host /usr is dropped and
+PATH is just the profile's bin. A fresh Rust/Python/JS project is auto-detected and the matching
+prologue activated. The flake's `outputs.tup` carries net, binds, ports, persist, gates, and the
+move ship/rebuild dial as plain data.
 
 BACKENDS:
     Default: pyrex, an in-house raw-namespace backend. Set TUP_SANDBOX=bwrap to use
     bubblewrap instead, or build with `--no-default-features` for a bwrap-only binary.
 
 Services are declared in ~/.tup/<project>/services, one directive per line:
-    start <name> <shell command>
-    stop  <name> <shell command>   (optional clean-quiesce hook)
+    start   <name> <shell command>
+    stop    <name> <shell command>          (optional clean-quiesce hook)
+    restart <name> no|on-failure|always     (optional; default no)
 
 Contain the blast radius of a coding agent; move its session between servers.
-See DESIGN.md for the full model."
+See DESIGN.md for the full model, DOCKER_PARITY.md for the Docker mapping."
     );
 }
